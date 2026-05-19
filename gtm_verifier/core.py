@@ -1,6 +1,7 @@
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Optional, Tuple
 
 from selenium import webdriver
@@ -12,32 +13,49 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 import config
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
-_GREEN = "\033[92m"
-_RED = "\033[91m"
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
 _YELLOW = "\033[93m"
-_CYAN = "\033[96m"
-_BOLD = "\033[1m"
-_DIM = "\033[2m"
-_RESET = "\033[0m"
+_CYAN   = "\033[96m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
+_RESET  = "\033[0m"
+
+_SEVERITY_COLOUR = {
+    "CRITICAL": "\033[91m\033[1m",  # bold red
+    "HIGH":     "\033[91m",         # red
+    "MEDIUM":   "\033[93m",         # yellow
+    "LOW":      "\033[2m",          # dim
+    "INFO":     "\033[96m",         # blue
+}
+
+
+# ── Severity ──────────────────────────────────────────────────────────────────
+
+class Severity(str, Enum):
+    CRITICAL = "CRITICAL"
+    HIGH     = "HIGH"
+    MEDIUM   = "MEDIUM"
+    LOW      = "LOW"
+    INFO     = "INFO"
 
 
 # ── Result type ───────────────────────────────────────────────────────────────
 
 @dataclass
 class CheckResult:
-    name: str
-    event: Optional[dict]   # matched dataLayer entry; None if not found or skipped
-    passed: bool
-    detail: str
-    skipped: bool = False
+    name:     str
+    event:    Optional[dict]    # matched dataLayer entry; None if not found or skipped
+    passed:   bool
+    detail:   str
+    skipped:  bool     = False
+    severity: Severity = Severity.HIGH
 
 
 # ── Driver ────────────────────────────────────────────────────────────────────
 
-def make_driver() -> webdriver.Chrome:
+def make_driver(performance_logging: bool = False) -> webdriver.Chrome:
     opts = Options()
-    opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-blink-features=AutomationControlled")
@@ -47,6 +65,10 @@ def make_driver() -> webdriver.Chrome:
     )
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+
+    # Performance logging must be set last to avoid capability conflicts
+    if performance_logging:
+        opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     driver = webdriver.Chrome(options=opts)
     # Mask navigator.webdriver so GTM consent/detection code behaves normally
@@ -60,7 +82,6 @@ def make_driver() -> webdriver.Chrome:
 # ── dataLayer helpers ─────────────────────────────────────────────────────────
 
 def get_datalayer_length(driver: webdriver.Chrome) -> int:
-    """Snapshot the current length of window.dataLayer."""
     return driver.execute_script("return (window.dataLayer || []).length")
 
 
@@ -126,6 +147,7 @@ def check_event(
     after_index: int,
     check_name: Optional[str] = None,
     timeout: Optional[float] = None,
+    severity: Severity = Severity.HIGH,
 ) -> CheckResult:
     """Poll for event_name then validate required_fields. Returns a CheckResult."""
     name = check_name or event_name
@@ -138,10 +160,14 @@ def check_event(
             event=None,
             passed=False,
             detail=f"Event '{event_name}' not found in dataLayer within {poll_timeout}s",
+            severity=severity,
         )
 
     if not required_fields:
-        return CheckResult(name=name, event=entry, passed=True, detail="Event found")
+        return CheckResult(
+            name=name, event=entry, passed=True,
+            detail="Event found", severity=severity,
+        )
 
     failures = validate_fields(entry, required_fields)
     if failures:
@@ -150,18 +176,25 @@ def check_event(
             event=entry,
             passed=False,
             detail="Field validation failed: " + "; ".join(failures),
+            severity=severity,
         )
-    return CheckResult(name=name, event=entry, passed=True, detail="All required fields present")
+    return CheckResult(
+        name=name, event=entry, passed=True,
+        detail="All required fields present", severity=severity,
+    )
 
 
 # ── Convenience constructors ──────────────────────────────────────────────────
 
-def skip_check(name: str, reason: str) -> CheckResult:
-    return CheckResult(name=name, event=None, passed=False, detail=reason, skipped=True)
+def skip_check(name: str, reason: str, severity: Severity = Severity.HIGH) -> CheckResult:
+    return CheckResult(
+        name=name, event=None, passed=False,
+        detail=reason, skipped=True, severity=severity,
+    )
 
 
-def failed_check(name: str, detail: str) -> CheckResult:
-    return CheckResult(name=name, event=None, passed=False, detail=detail)
+def failed_check(name: str, detail: str, severity: Severity = Severity.HIGH) -> CheckResult:
+    return CheckResult(name=name, event=None, passed=False, detail=detail, severity=severity)
 
 
 # ── Interaction helpers ───────────────────────────────────────────────────────
@@ -175,7 +208,6 @@ def accept_consent(driver: webdriver.Chrome) -> None:
 
 
 def _click(driver: webdriver.Chrome, selector: str) -> None:
-    """Wait for selector to be clickable then click it."""
     el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
         EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
     )
@@ -183,7 +215,6 @@ def _click(driver: webdriver.Chrome, selector: str) -> None:
 
 
 def _type(driver: webdriver.Chrome, selector: str, text: str) -> None:
-    """Wait for selector to be visible, clear it, then type text."""
     el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
         EC.visibility_of_element_located((By.CSS_SELECTOR, selector))
     )
@@ -196,7 +227,7 @@ def _type(driver: webdriver.Chrome, selector: str, text: str) -> None:
 def print_report(journey_results: List[Tuple[str, List[CheckResult]]]) -> int:
     """
     Print a coloured per-journey report.
-    Returns 0 if no failures, 1 if any check failed.
+    Returns 0 if no failures, 1 if any check failed (excluding INFO).
     """
     total = passed = failed = skipped = 0
 
@@ -206,13 +237,28 @@ def print_report(journey_results: List[Tuple[str, List[CheckResult]]]) -> int:
             total += 1
             if r.skipped:
                 skipped += 1
-                print(f"  {_YELLOW}⊘ SKIP{_RESET}  {r.name}  {_DIM}({r.detail}){_RESET}")
+                sev_col = _SEVERITY_COLOUR.get(r.severity.value, "")
+                print(
+                    f"  {_YELLOW}⊘ SKIP{_RESET}  "
+                    f"{sev_col}[{r.severity.value}]{_RESET}  "
+                    f"{r.name}  {_DIM}({r.detail}){_RESET}"
+                )
             elif r.passed:
                 passed += 1
-                print(f"  {_GREEN}✓ PASS{_RESET}  {r.name}")
+                if r.severity == Severity.INFO:
+                    print(f"  {_CYAN}ℹ INFO{_RESET}  {r.name}  {_DIM}{r.detail}{_RESET}")
+                else:
+                    print(f"  {_GREEN}✓ PASS{_RESET}  {r.name}")
             else:
-                failed += 1
-                print(f"  {_RED}✗ FAIL{_RESET}  {r.name}  —  {r.detail}")
+                # INFO failures don't count toward exit code
+                if r.severity != Severity.INFO:
+                    failed += 1
+                sev_col = _SEVERITY_COLOUR.get(r.severity.value, "")
+                print(
+                    f"  {_RED}✗ FAIL{_RESET}  "
+                    f"{sev_col}[{r.severity.value}]{_RESET}  "
+                    f"{r.name}  —  {r.detail}"
+                )
                 if r.event is not None:
                     pretty = json.dumps(r.event, indent=4, default=str)
                     indented = "\n".join("        " + line for line in pretty.splitlines())

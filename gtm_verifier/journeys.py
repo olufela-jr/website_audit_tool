@@ -1,6 +1,9 @@
 import re
 from typing import List
 
+from analytics import run_analytics_audit
+from consent import run_consent_audit
+from network import run_network_audit
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -30,7 +33,7 @@ def _add_product_to_cart(driver) -> None:
     _click(driver, config.ADD_TO_CART_BUTTON)
 
 
-# ── Journeys ──────────────────────────────────────────────────────────────────
+# ── Journeys
 
 def journey_page_load() -> List[CheckResult]:
     driver = make_driver()
@@ -414,3 +417,15 @@ def journey_search() -> List[CheckResult]:
     finally:
         driver.quit()
     return results
+
+
+def journey_analytics_audit() -> List[CheckResult]:
+    return run_analytics_audit(config.BASE_URL)
+
+
+def journey_consent_audit() -> List[CheckResult]:
+    return run_consent_audit(config.BASE_URL)
+
+
+def journey_network_audit() -> List[CheckResult]:
+    return run_network_audit(config.BASE_URL)

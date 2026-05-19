@@ -18,7 +18,10 @@ from core import CheckResult, failed_check, print_report
 import journeys
 
 JOURNEY_MAP: Dict[str, callable] = {
-    "page_load":      journeys.journey_page_load,
+    "analytics_audit": journeys.journey_analytics_audit,
+    "consent_audit":   journeys.journey_consent_audit,
+    "network_audit":   journeys.journey_network_audit,
+    "page_load":       journeys.journey_page_load,
     "consent":        journeys.journey_consent,
     "shop":           journeys.journey_shop,
     "product_detail": journeys.journey_product_detail,
