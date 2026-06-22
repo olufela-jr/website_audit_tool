@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -58,6 +59,11 @@ def make_driver(performance_logging: bool = False) -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    # Run without a visible window only when explicitly requested (e.g. on a
+    # server). Defaults to a visible browser so runs can be watched locally.
+    if os.environ.get("HEADLESS") == "1":
+        opts.add_argument("--headless=new")
+        opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -133,6 +139,8 @@ def validate_fields(event_entry: dict, required_fields: List[str]) -> List[str]:
                 break
         if error:
             failures.append(f"'{path}' not accessible: {error}")
+        # Note: only None / "" / [] count as empty. A literal 0 or False is a
+        # valid value (e.g. ecommerce value of 0), so those deliberately pass.
         elif value is None or value == "" or value == []:
             failures.append(f"'{path}' is empty (got {value!r})")
     return failures
@@ -222,14 +230,39 @@ def _type(driver: webdriver.Chrome, selector: str, text: str) -> None:
     el.send_keys(text)
 
 
+# ── Scoring ───────────────────────────────────────────────────────────────────
+
+def score_checks(checks: List[CheckResult]) -> Tuple[int, int, float]:
+    """
+    Equal-weighted score for a set of checks: PASS=1, FAIL=0.
+    SKIP and INFO checks are excluded from the denominator (they are not
+    pass/fail gates). Returns (passed, scorable_total, percent).
+    """
+    scorable = [c for c in checks if not c.skipped and c.severity != Severity.INFO]
+    passed = sum(1 for c in scorable if c.passed)
+    total = len(scorable)
+    pct = (passed / total * 100.0) if total else 0.0
+    return passed, total, pct
+
+
+def _score_colour(pct: float) -> str:
+    if pct >= 80:
+        return _GREEN
+    if pct >= 50:
+        return _YELLOW
+    return _RED
+
+
 # ── Report printer ────────────────────────────────────────────────────────────
 
 def print_report(journey_results: List[Tuple[str, List[CheckResult]]]) -> int:
     """
-    Print a coloured per-journey report.
-    Returns 0 if no failures, 1 if any check failed (excluding INFO).
+    Print a coloured per-journey report with an equal-weighted score per audit
+    and an overall score. Returns 0 if no failures, 1 if any check failed
+    (excluding INFO).
     """
     total = passed = failed = skipped = 0
+    overall_passed = overall_scorable = 0
 
     for journey_name, checks in journey_results:
         print(f"\n{_CYAN}{_BOLD}── {journey_name} ──{_RESET}")
@@ -264,10 +297,23 @@ def print_report(journey_results: List[Tuple[str, List[CheckResult]]]) -> int:
                     indented = "\n".join("        " + line for line in pretty.splitlines())
                     print(f"{_DIM}        dataLayer entry:\n{indented}{_RESET}")
 
+        j_passed, j_total, j_pct = score_checks(checks)
+        overall_passed += j_passed
+        overall_scorable += j_total
+        print(
+            f"  {_BOLD}Score: {_score_colour(j_pct)}{j_pct:.0f}%{_RESET}"
+            f"{_BOLD} ({j_passed}/{j_total}){_RESET}"
+        )
+
+    overall_pct = (overall_passed / overall_scorable * 100.0) if overall_scorable else 0.0
     status_colour = _GREEN if failed == 0 else _RED
     print(
         f"\n{_BOLD}{status_colour}"
         f"Total: {total}  Passed: {passed}  Failed: {failed}  Skipped: {skipped}"
-        f"{_RESET}\n"
+        f"{_RESET}"
+    )
+    print(
+        f"{_BOLD}Overall score: {_score_colour(overall_pct)}{overall_pct:.0f}%{_RESET}"
+        f"{_BOLD} ({overall_passed}/{overall_scorable}){_RESET}\n"
     )
     return 1 if failed > 0 else 0

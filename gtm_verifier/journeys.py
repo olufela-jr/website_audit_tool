@@ -4,6 +4,9 @@ from typing import List
 from analytics import run_analytics_audit
 from consent import run_consent_audit
 from network import run_network_audit
+from seo import run_seo_audit
+from security_headers import run_security_headers_audit
+from tags_inventory import run_tag_inventory_audit
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -429,3 +432,15 @@ def journey_consent_audit() -> List[CheckResult]:
 
 def journey_network_audit() -> List[CheckResult]:
     return run_network_audit(config.BASE_URL)
+
+
+def journey_tag_inventory() -> List[CheckResult]:
+    return run_tag_inventory_audit(config.BASE_URL)
+
+
+def journey_seo() -> List[CheckResult]:
+    return run_seo_audit(config.BASE_URL)
+
+
+def journey_security_headers() -> List[CheckResult]:
+    return run_security_headers_audit(config.BASE_URL)

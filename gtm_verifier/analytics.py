@@ -2,7 +2,7 @@
 Analytics setup detection.
 
 Establishes whether a valid GA4/GTM implementation exists and how it is deployed.
-Uses DOM inspection, JavaScript object state, and resource timing — no network proxy.
+Uses DOM inspection, JavaScript object state, and CDP network capture — no proxy.
 
 Outputs per page load:
   - GA4 presence and measurement ID(s)
@@ -13,19 +13,27 @@ Outputs per page load:
 """
 
 import re
-import time
 from typing import List
 from urllib.parse import urlparse
 
 from selenium.common.exceptions import WebDriverException
 
 from core import CheckResult, accept_consent, make_driver
+from network import extract_collect_requests
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
 _RE_GA4_ID  = re.compile(r'\bG-[A-Z0-9]{6,}\b')
 _RE_GTM_ID  = re.compile(r'\bGTM-[A-Z0-9]{4,}\b')
 
-_RE_GA_HOST  = re.compile(r'(?:^|\.)google-analytics\.com$')
+# Google's own collection / measurement domains. A collect request to any of
+# these is third-party. Anything else is a genuine first-party / sGTM endpoint.
+#   google-analytics.com        — classic GA endpoint (+ regionN. subdomains)
+#   analytics.google.com        — matched via google.com
+#   stats.g.doubleclick.net     — matched via doubleclick.net
+#   googletagmanager.com        — GTM / server container default
+_RE_GA_HOST = re.compile(
+    r'(?:^|\.)(?:google-analytics\.com|google\.com|doubleclick\.net|googletagmanager\.com)$'
+)
 _RE_GTM_HOST = re.compile(r'(?:^|\.)googletagmanager\.com$')
 
 
@@ -40,20 +48,8 @@ def _host(url_str: str) -> str:
         return ""
 
 
-def _poll_resources(driver, match_fn, timeout: float = 8.0) -> List[str]:
-    """Poll resource timing entries until match_fn hits or timeout. Returns matched URLs."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        urls = _exec(driver, "performance.getEntriesByType('resource').map(e => e.name)") or []
-        matched = [u for u in urls if match_fn(u)]
-        if matched:
-            return matched
-        time.sleep(0.3)
-    return []
-
-
 def run_analytics_audit(url: str) -> List[CheckResult]:
-    driver = make_driver()
+    driver = make_driver(performance_logging=True)
     results = []
     try:
         driver.get(url)
@@ -77,12 +73,14 @@ def run_analytics_audit(url: str) -> List[CheckResult]:
             gtmKeys      : Object.keys(window.google_tag_manager || {})
         })""") or {}
 
-        # ── Resource timing (poll so async GA4 hits have time to fire) ────
-        collect_urls = _poll_resources(
-            driver,
-            lambda u: "/collect" in u or "collect?" in u,
-            timeout=6.0,
-        )
+        # ── Network: GA4 collect requests via CDP performance log ─────────
+        # Uses the same capture path as network_audit so the two audits agree
+        # (resource timing misses sendBeacon/fetch collect hits).
+        collect_requests = extract_collect_requests(driver, timeout=6.0)
+        collect_urls = [r["url"] for r in collect_requests]
+
+        # Script/loader resources (gtm.js, gtag.js, gtg) are normal GETs that
+        # resource timing captures reliably — keep using it for those.
         all_resources = (
             _exec(driver, "performance.getEntriesByType('resource').map(e => e.name)") or []
         )
@@ -120,7 +118,7 @@ def run_analytics_audit(url: str) -> List[CheckResult]:
             detail=(
                 f"Measurement IDs detected: {', '.join(ga4_ids)}"
                 if ga4_ids
-                else "No GA4 measurement ID found in scripts or resource timing"
+                else "No GA4 measurement ID found in scripts or network requests"
             ),
         ))
 
@@ -202,8 +200,8 @@ def run_analytics_audit(url: str) -> List[CheckResult]:
                 event=None,
                 passed=False,
                 detail=(
-                    "No collect requests observed in resource timing "
-                    "(may fire via sendBeacon after user interaction)"
+                    "No collect requests observed in the network log "
+                    "(may fire only after user interaction)"
                 ),
             ))
 

@@ -1,0 +1,136 @@
+HOW TO RUN AUDITS LOCALLY
+================================================================================
+
+SETUP (first time only)
+------------------------
+cd /Users/fela.sanu/Documents/code/website_audit_tool
+source venv/bin/activate
+cd gtm_verifier
+
+
+RUNNING AUDITS
+--------------
+Terminal output (default):
+  python run.py                          # all audits
+  python run.py analytics_audit          # one audit
+  python run.py page_load consent shop   # multiple audits
+
+PowerPoint export (new):
+  python run.py --export report.pptx                     # all audits → PowerPoint
+  python run.py analytics_audit --export audit.pptx      # specific audits → PowerPoint
+  python run.py -e report.pptx consent_audit network_audit
+
+With custom config:
+  python run.py --config myconfig.yaml --export report.pptx
+
+
+CURRENT STATUS
+--------------
+Working now (no selectors required):
+  analytics_audit, consent_audit, network_audit
+
+Not yet runnable (CSS selectors in config.yaml still need filling in):
+  page_load, consent, shop, product_detail, cart, checkout,
+  purchase, subscribe, contact, search
+
+Only confirmed selector so far:
+  consent.accept_button = ".clearcookie-button--accept-all"
+
+To wire up a journey, open gtm_verifier/config.yaml, find the TODO
+selector for that journey, right-click the element on the real site in
+Chrome DevTools → Copy → Copy selector, and paste it in.
+
+
+AUDITS & WHERE THEY LIVE IN THE CODE
+--------------------------------------
+
+  analytics_audit     analytics.py  →  run_analytics_audit()   ✓ WORKING
+  ---------------------------------------------------------------
+  Checks GA4/GTM is present and correctly deployed.
+  No selectors needed.
+
+  consent_audit       consent.py    →  run_consent_audit()
+  ---------------------------------------------------------------
+  Checks CMP banner, Consent Mode signals, pre-consent GA4 firing,
+  and post-consent update.
+  No selectors needed.
+
+  network_audit       network.py    →  run_network_audit()
+  ---------------------------------------------------------------
+  Captures GA4 collect requests via Chrome DevTools Protocol.
+  Reports client ID, session ID, consent state, event inventory,
+  and session timeline.
+  No selectors needed.
+
+  page_load           journeys.py   →  journey_page_load()
+  ---------------------------------------------------------------
+  Checks init and page_view fire on the homepage.
+  Selector needed: consent.accept_button
+
+  consent             journeys.py   →  journey_consent()
+  ---------------------------------------------------------------
+  Checks consent_update fires after accepting the banner.
+  Selector needed: consent.accept_button
+
+  shop                journeys.py   →  journey_shop()
+  ---------------------------------------------------------------
+  Checks view_item_list and select_item on the /shop page.
+  Selectors needed: consent.accept_button, shop.product_card
+
+  product_detail      journeys.py   →  journey_product_detail()
+  ---------------------------------------------------------------
+  Checks view_item and add_to_cart on the product detail page.
+  Selectors needed: consent.accept_button, shop.product_card,
+                    product_detail.add_to_cart
+
+  cart                journeys.py   →  journey_cart()
+  ---------------------------------------------------------------
+  Checks view_cart, remove_from_cart, begin_checkout.
+  Selectors needed: consent.accept_button, shop.product_card,
+                    product_detail.add_to_cart, cart.remove_button,
+                    cart.proceed_to_checkout
+
+  checkout            journeys.py   →  journey_checkout()
+  ---------------------------------------------------------------
+  Checks add_shipping_info after filling address and emirate.
+  Selectors needed: consent.accept_button, shop.product_card,
+                    product_detail.add_to_cart,
+                    checkout.address_field, checkout.emirate_field
+
+  purchase            journeys.py   →  journey_purchase()
+  ---------------------------------------------------------------
+  Checks purchase event and transaction_id format on the order
+  confirmation page (ORDER_CONFIRMATION_URL in config.yaml).
+  Selector needed: consent.accept_button
+
+  subscribe           journeys.py   →  journey_subscribe()
+  ---------------------------------------------------------------
+  Checks select_promotion and generate_lead on /subscribe.
+  Selectors needed: consent.accept_button, subscribe.plan_card,
+                    subscribe.form_email, subscribe.form_submit
+
+  contact             journeys.py   →  journey_contact()
+  ---------------------------------------------------------------
+  Checks form_start, form_submit_error, form_submit on /contact.
+  Selectors needed: consent.accept_button, contact.first_field,
+                    contact.name_field, contact.email_field,
+                    contact.message_field, contact.submit_button
+
+  search              journeys.py   →  journey_search()
+  ---------------------------------------------------------------
+  Checks search event fires with search_term and result count.
+  Selectors needed: consent.accept_button, search.input,
+                    search.submit
+
+
+RECOMMENDED ORDER
+-----------------
+Step 1 — infrastructure (works immediately, no selectors):
+  python run.py analytics_audit consent_audit network_audit
+
+Step 2 — fill in selectors in gtm_verifier/config.yaml, then:
+  python run.py page_load consent
+  python run.py shop product_detail cart checkout purchase
+  python run.py subscribe contact search
+
+================================================================================

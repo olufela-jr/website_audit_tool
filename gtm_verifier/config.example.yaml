@@ -1,0 +1,52 @@
+# Copy this file to config.yaml and fill in the values for the site you are
+# auditing.  config.yaml is git-ignored so client-specific URLs / IDs never get
+# committed.  config.py auto-loads config.yaml on import.
+
+site:
+  base_url: "https://example.com"
+  order_confirmation_url: "https://example.com/order/1"
+
+tags:
+  gtm_id: "GTM-XXXXXXX"
+  ga4_id: "G-XXXXXXXXXX"
+
+timeouts:
+  default: 10       # seconds — WebDriverWait for DOM elements
+  event_poll: 15    # seconds — dataLayer event polling
+
+# CSS selectors for the interactive journeys.  The three infrastructure audits
+# (analytics_audit, consent_audit, network_audit) need none of these.
+# Right-click the element in Chrome DevTools → Copy → Copy selector.
+selectors:
+  consent:
+    accept_button: ".cookie-accept-all"             # CMP "Accept all" button
+
+  shop:
+    product_card: ".product-card"                   # clickable product card (listing page)
+
+  product_detail:
+    add_to_cart: "button.add-to-cart"               # add-to-cart button (PDP)
+
+  cart:
+    remove_button: "button.remove-item"             # remove-item button in cart
+    proceed_to_checkout: "button.checkout"          # proceed-to-checkout button in cart
+
+  checkout:
+    address_field: "input[name='address']"          # street address text input
+    emirate_field: "select[name='emirate']"         # emirate/state <select> element
+
+  subscribe:
+    plan_card: ".plan-card"                         # subscription plan card
+    form_email: "input[name='email']"               # subscribe form email input
+    form_submit: "button[type='submit'].subscribe"  # subscribe form submit button
+
+  contact:
+    first_field: "input[name='name']"               # first focusable field in contact form
+    name_field: "input[name='name']"                # contact name input
+    email_field: "input[name='email']"              # contact email input
+    message_field: "textarea[name='message']"       # contact message textarea
+    submit_button: "button[type='submit'].contact"  # contact form submit button
+
+  search:
+    input: "input[type='search']"                   # search text input
+    submit: "button[type='submit'].search"          # search submit button

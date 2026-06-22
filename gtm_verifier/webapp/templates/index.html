@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GTM / GA4 Verifier</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      max-width: 640px; margin: 6vh auto; padding: 0 1.25rem; line-height: 1.5;
+    }
+    h1 { margin-bottom: .25rem; }
+    p.sub { color: #666; margin-top: 0; }
+    form { margin-top: 2rem; }
+    label.field { display: block; font-weight: 600; margin-bottom: .4rem; }
+    input[type=url], input[type=text] {
+      width: 100%; padding: .7rem .8rem; font-size: 1rem; box-sizing: border-box;
+      border: 1px solid #bbb; border-radius: 8px;
+    }
+    fieldset { margin: 1.25rem 0; border: 1px solid #ddd; border-radius: 8px; padding: .8rem 1.25rem 1rem; }
+    legend { font-weight: 600; padding: 0 .4rem; }
+    .blurb { color: #888; font-size: .82rem; margin: 0 0 .6rem; }
+    .check { display: flex; align-items: center; gap: .6rem; margin: .4rem 0; }
+    button {
+      font-size: 1rem; font-weight: 600; padding: .7rem 1.4rem; border: 0;
+      border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    .error { background: #fee2e2; color: #991b1b; padding: .7rem 1rem; border-radius: 8px; }
+    .note { color: #888; font-size: .85rem; margin-top: 1.5rem; }
+
+    /* Running overlay */
+    #overlay {
+      display: none; position: fixed; inset: 0; z-index: 50;
+      background: rgba(17, 24, 39, .82); color: #fff;
+      flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 1.5rem;
+    }
+    #overlay.show { display: flex; }
+    .spinner {
+      width: 48px; height: 48px; border-radius: 50%;
+      border: 5px solid rgba(255, 255, 255, .25); border-top-color: #fff;
+      animation: spin 0.9s linear infinite; margin-bottom: 1.25rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #overlay h2 { margin: 0 0 .4rem; }
+    #overlay .running-list { margin: .5rem 0 0; font-size: .95rem; opacity: .9; }
+    #overlay .hint { margin-top: 1rem; font-size: .82rem; opacity: .7; max-width: 22rem; }
+  </style>
+</head>
+<body>
+  <h1>GTM / GA4 Verifier</h1>
+  <p class="sub">Audit a site's analytics setup. A Chrome window will open while it runs.</p>
+
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+  <form id="audit-form" action="{{ url_for('run_audit') }}" method="post">
+    <label class="field" for="url">Website URL</label>
+    <input type="text" id="url" name="url" placeholder="https://example.com"
+           value="{{ url or '' }}" autofocus required>
+
+    {% for group in groups %}
+    <fieldset>
+      <legend>{{ group.title }}</legend>
+      <p class="blurb">{{ group.blurb }}</p>
+      {% for key, label, _fn in group['items'] %}
+      <div class="check">
+        <input type="checkbox" id="{{ key }}" name="{{ key }}" {{ 'checked' if group.default else '' }}>
+        <label for="{{ key }}">{{ label }}</label>
+      </div>
+      {% endfor %}
+    </fieldset>
+    {% endfor %}
+
+    <button type="submit">Run audit</button>
+  </form>
+
+  <p class="note">Runs take roughly 10&ndash;30 seconds per audit while Chrome loads the page.</p>
+
+  <div id="overlay">
+    <div class="spinner"></div>
+    <h2>Running audit&hellip;</h2>
+    <div class="running-list" id="running-list"></div>
+    <p class="hint">This can take up to a minute. Browser audits will open a Chrome window &mdash; please leave it alone until the results appear.</p>
+  </div>
+
+  <script>
+    (function () {
+      var form = document.getElementById('audit-form');
+      form.addEventListener('submit', function () {
+        var labels = [];
+        form.querySelectorAll('input[type=checkbox]:checked').forEach(function (cb) {
+          var lbl = form.querySelector('label[for="' + cb.id + '"]');
+          if (lbl) { labels.push(lbl.textContent.trim()); }
+        });
+        var list = document.getElementById('running-list');
+        list.textContent = labels.length ? labels.join('  ·  ') : '';
+        document.getElementById('overlay').classList.add('show');
+        // Let the normal POST proceed; the overlay stays until the results page loads.
+      });
+      // If the user navigates back to this page, make sure the overlay is hidden.
+      window.addEventListener('pageshow', function () {
+        document.getElementById('overlay').classList.remove('show');
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -2,10 +2,10 @@
 GTM / GA4 dataLayer verifier
 
 Usage:
-    python run.py                                    # all journeys, default config
-    python run.py page_load consent shop             # specific journeys, default config
-    python run.py --config staging.yaml              # all journeys, custom config file
-    python run.py --config staging.yaml shop cart    # specific journeys, custom config file
+    python run.py                                    # all journeys, terminal output
+    python run.py page_load consent shop             # specific journeys
+    python run.py --export report.pptx               # export to PowerPoint
+    python run.py --config staging.yaml --export report.pptx
 """
 
 import argparse
@@ -15,12 +15,16 @@ from typing import Dict, List, Tuple
 
 import config  # auto-loads config.yaml on import
 from core import CheckResult, failed_check, print_report
+from export import export_to_powerpoint
 import journeys
 
 JOURNEY_MAP: Dict[str, callable] = {
     "analytics_audit": journeys.journey_analytics_audit,
     "consent_audit":   journeys.journey_consent_audit,
     "network_audit":   journeys.journey_network_audit,
+    "tag_inventory":   journeys.journey_tag_inventory,
+    "seo":             journeys.journey_seo,
+    "security_headers": journeys.journey_security_headers,
     "page_load":       journeys.journey_page_load,
     "consent":        journeys.journey_consent,
     "shop":           journeys.journey_shop,
@@ -64,6 +68,11 @@ def main() -> None:
         help="Path to a YAML config file (default: config.yaml in this directory).",
     )
     parser.add_argument(
+        "--export", "-e",
+        metavar="FILE.pptx",
+        help="Export results to PowerPoint file instead of terminal output.",
+    )
+    parser.add_argument(
         "journeys",
         nargs="*",
         metavar="JOURNEY",
@@ -88,8 +97,19 @@ def main() -> None:
     if not journey_results:
         print("No journeys were run.", file=sys.stderr)
         sys.exit(1)
-    exit_code = print_report(journey_results)
-    sys.exit(exit_code)
+
+    if args.export:
+        # Export to PowerPoint
+        try:
+            export_to_powerpoint(journey_results, config.BASE_URL, args.export)
+            sys.exit(0)
+        except Exception as exc:
+            print(f"Failed to export to PowerPoint: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Terminal output
+        exit_code = print_report(journey_results)
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

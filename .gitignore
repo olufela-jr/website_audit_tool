@@ -20,7 +20,14 @@ build/
 .vscode/
 .idea/
 
-# Logs / reports
+# Logs
 *.log
 
-*.yaml
+# Generated audit reports
+*.pptx
+*.ppt
+
+# Local config (may contain client URLs / IDs).
+# Copy gtm_verifier/config.example.yaml to config.yaml and fill it in.
+gtm_verifier/config.yaml
+*.local.yaml

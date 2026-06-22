@@ -1,0 +1,52 @@
+# Bundled GA4 standard spec (Stream 2: URL-only audit).
+# This is the "expected" side of an audit when we have no client config —
+# GA4 recommended events and the params they should carry. Stream 1 will
+# generate a file of this exact shape from a client's GTM container instead.
+#
+# Required-field lists here mirror what journeys.py currently hardcodes, so the
+# data-driven runner produces the same checks as the hand-written journeys.
+
+events:
+  init:
+    required: [client_id, user_properties.customer_type]
+    severity: HIGH
+
+  page_view:
+    required: [page_title, page_path]
+    severity: HIGH
+
+  view_item_list:
+    required: [ecommerce.items]
+    severity: HIGH
+
+  select_item:
+    required: [ecommerce.items.0]
+    severity: HIGH
+
+  view_item:
+    required: [ecommerce.value, ecommerce.items.0]
+    severity: HIGH
+
+  add_to_cart:
+    required: [ecommerce.value, ecommerce.items.0.quantity]
+    severity: HIGH
+
+  view_cart:
+    required: [ecommerce.value, ecommerce.items]
+    severity: MEDIUM
+
+  begin_checkout:
+    required: []
+    severity: HIGH
+
+  add_shipping_info:
+    required: [ecommerce.shipping_tier]
+    severity: MEDIUM
+
+  purchase:
+    required: [ecommerce.transaction_id, ecommerce.value, ecommerce.shipping, ecommerce.items]
+    severity: CRITICAL
+    params:
+      # Demonstrates that journey_purchase's bespoke transaction_id regex is now
+      # declarative — no custom Python per site.
+      ecommerce.transaction_id: { pattern: '^PV-\d+$' }

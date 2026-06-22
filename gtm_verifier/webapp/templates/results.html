@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audit results — {{ url }}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      max-width: 900px; margin: 5vh auto; padding: 0 1.25rem; line-height: 1.5;
+    }
+    a.back { color: #2563eb; text-decoration: none; }
+    .topbar { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 1rem; }
+    .overall { font-size: 1.1rem; font-weight: 600; }
+    .pct { padding: .15rem .55rem; border-radius: 6px; color: #fff; }
+    .good { background: #16a34a; } .mid { background: #d97706; } .bad { background: #dc2626; }
+    .dl {
+      display: inline-block; margin: .5rem 0 1.5rem; font-weight: 600; padding: .6rem 1.2rem;
+      border-radius: 8px; background: #2563eb; color: #fff; text-decoration: none;
+    }
+    section.audit { border: 1px solid #ddd; border-radius: 10px; margin: 1.25rem 0; overflow: hidden; }
+    section.audit > header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: .8rem 1rem; background: #f3f4f6; font-weight: 600;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+    td, th { text-align: left; padding: .55rem .7rem; border-top: 1px solid #eee; vertical-align: top; }
+    .badge { font-weight: 700; font-size: .8rem; padding: .1rem .45rem; border-radius: 5px; white-space: nowrap; }
+    .PASS { background: #dcfce7; color: #166534; }
+    .FAIL { background: #fee2e2; color: #991b1b; }
+    .SKIP { background: #fef9c3; color: #854d0e; }
+    .INFO { background: #dbeafe; color: #1e40af; }
+    .sev { color: #888; font-size: .8rem; }
+    details { margin-top: .4rem; }
+    summary { cursor: pointer; color: #2563eb; font-size: .82rem; }
+    pre { background: #0b1021; color: #d6e2ff; padding: .8rem; border-radius: 6px; overflow-x: auto; font-size: .8rem; }
+  </style>
+</head>
+<body>
+  {% macro pct_class(p) %}{% if p >= 80 %}good{% elif p >= 50 %}mid{% else %}bad{% endif %}{% endmacro %}
+
+  <div class="topbar">
+    <div>
+      <a class="back" href="{{ url_for('index') }}">&larr; New audit</a>
+      <h1 style="margin:.2rem 0">{{ url }}</h1>
+    </div>
+    <div class="overall">
+      Overall
+      <span class="pct {{ pct_class(overall_pct) }}">{{ '%.0f' % overall_pct }}%</span>
+      <span style="color:#888;font-weight:400">({{ overall_passed }}/{{ overall_total }})</span>
+    </div>
+  </div>
+
+  <a class="dl" href="{{ url_for('download_report', run_id=run_id) }}">Download PowerPoint</a>
+
+  {% for a in audits %}
+  <section class="audit">
+    <header>
+      <span>{{ a.name }}</span>
+      <span class="pct {{ pct_class(a.pct) }}">{{ '%.0f' % a.pct }}% ({{ a.passed }}/{{ a.total }})</span>
+    </header>
+    <table>
+      <tbody>
+      {% for r in a.rows %}
+        <tr>
+          <td><span class="badge {{ r.status }}">{{ r.status }}</span></td>
+          <td>
+            <strong>{{ r.name }}</strong>
+            <span class="sev">[{{ r.severity }}]</span>
+            <div>{{ r.detail }}</div>
+            {% if r.status == 'FAIL' and r.event %}
+            <details>
+              <summary>dataLayer entry</summary>
+              <pre>{{ r.event | tojson(indent=2) }}</pre>
+            </details>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endfor %}
+</body>
+</html>
