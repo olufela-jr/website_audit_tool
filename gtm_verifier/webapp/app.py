@@ -13,6 +13,7 @@ Run from the gtm_verifier directory:
 Then open http://localhost:5000.
 """
 
+import io
 import os
 import sys
 import tempfile
@@ -168,11 +169,19 @@ def download_report(run_id: str):
     run = _RUNS.get(run_id)
     if not run:
         abort(404, "This report has expired — please re-run the audit.")
+    # export_to_powerpoint writes to a path; generate into a temp file, read the
+    # bytes back, and delete it immediately so nothing is left in /tmp.
     tmp = tempfile.NamedTemporaryFile(suffix=".pptx", delete=False)
     tmp.close()
-    export_to_powerpoint(run["results"], run["url"], tmp.name)
+    try:
+        export_to_powerpoint(run["results"], run["url"], tmp.name)
+        with open(tmp.name, "rb") as f:
+            data = io.BytesIO(f.read())
+    finally:
+        os.unlink(tmp.name)
+    data.seek(0)
     return send_file(
-        tmp.name,
+        data,
         as_attachment=True,
         download_name="gtm_audit.pptx",
         mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",

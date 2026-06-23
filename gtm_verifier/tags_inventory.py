@@ -6,18 +6,26 @@ URL (via CDP performance logging) plus a set of known JavaScript globals. Each
 is matched against a signature table of common analytics / advertising vendors
 so the report can list "here is everything firing on your site".
 
-Findings are INFO severity (an inventory, not pass/fail), so they don't move the
-score.
+The per-vendor list is INFO severity (an inventory, not pass/fail). On top of
+that, two SCORED checks assert that the tags this site is *supposed* to run —
+the GTM container and GA4 measurement ID from config — are actually firing.
+Those move the score, so the tagging journey reports a real pass/fail instead
+of an all-INFO 0/0.
 """
 
 import json
+import re
 import time
 from typing import Dict, List, Set
 
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 
+import config
 from core import CheckResult, Severity, accept_consent, failed_check, make_driver
+
+_RE_GTM_ID = re.compile(r'GTM-[A-Z0-9]{4,}')
+_RE_GA4_ID = re.compile(r'G-[A-Z0-9]{6,}')
 
 # vendor -> {"urls": [substrings in request URLs], "globals": [JS global names]}
 _SIGNATURES: Dict[str, Dict[str, List[str]]] = {
@@ -75,6 +83,77 @@ def _detect_globals(driver: webdriver.Chrome, names: List[str]) -> Set[str]:
         return set()
 
 
+def _live_gtm_containers(driver: webdriver.Chrome) -> Set[str]:
+    """GTM container IDs that are live on the page (most authoritative signal).
+    Reads the keys of window.google_tag_manager, which GTM populates per
+    container once gtm.js has run."""
+    try:
+        keys = driver.execute_script(
+            "return Object.keys(window.google_tag_manager || {})"
+        ) or []
+    except WebDriverException:
+        return set()
+    return {k for k in keys if k.startswith("GTM-")}
+
+
+def _expected_tag_checks(
+    driver: webdriver.Chrome, seen_urls: Set[str]
+) -> List[CheckResult]:
+    """Scored pass/fail checks: are the configured GTM + GA4 tags actually
+    firing? Falls back to 'any GTM/GA4 detected' when config has no expected ID."""
+    url_blob = " ".join(seen_urls)
+    found_gtm = _live_gtm_containers(driver) | set(_RE_GTM_ID.findall(url_blob))
+    # GA4 IDs appear as id=G-XXXX (gtag/js loader) and tid=G-XXXX (g/collect hits).
+    found_ga4 = set(_RE_GA4_ID.findall(url_blob))
+
+    checks: List[CheckResult] = []
+
+    expected_gtm = config.GTM_ID
+    if expected_gtm:
+        passed = expected_gtm in found_gtm
+        checks.append(CheckResult(
+            name=f"GTM container {expected_gtm} firing",
+            event=None,
+            passed=passed,
+            detail=(f"Container {expected_gtm} detected"
+                    if passed else
+                    f"Expected {expected_gtm} but found: "
+                    f"{', '.join(sorted(found_gtm)) or 'no GTM container'}"),
+            severity=Severity.HIGH,
+        ))
+    else:
+        checks.append(CheckResult(
+            name="GTM container firing", event=None, passed=bool(found_gtm),
+            detail=(f"Containers: {', '.join(sorted(found_gtm))}"
+                    if found_gtm else "No GTM container detected"),
+            severity=Severity.HIGH,
+        ))
+
+    expected_ga4 = config.GA4_ID
+    if expected_ga4:
+        passed = expected_ga4 in found_ga4
+        checks.append(CheckResult(
+            name=f"GA4 measurement ID {expected_ga4} firing",
+            event=None,
+            passed=passed,
+            detail=(f"Measurement ID {expected_ga4} detected in network traffic"
+                    if passed else
+                    f"Expected {expected_ga4} but found: "
+                    f"{', '.join(sorted(found_ga4)) or 'no GA4 hits'} "
+                    "(GA4 collect may require granted consent)"),
+            severity=Severity.HIGH,
+        ))
+    else:
+        checks.append(CheckResult(
+            name="GA4 measurement ID firing", event=None, passed=bool(found_ga4),
+            detail=(f"Measurement IDs: {', '.join(sorted(found_ga4))}"
+                    if found_ga4 else "No GA4 measurement ID detected"),
+            severity=Severity.HIGH,
+        ))
+
+    return checks
+
+
 def run_tag_inventory_audit(url: str) -> List[CheckResult]:
     driver = make_driver(performance_logging=True)
     results: List[CheckResult] = []
@@ -110,6 +189,10 @@ def run_tag_inventory_audit(url: str) -> List[CheckResult]:
                 detail=" | ".join(how), severity=Severity.INFO,
             ))
 
+        # Scored checks: the expected GTM + GA4 tags must actually be firing.
+        # These have HIGH severity so they count toward the journey score.
+        scored = _expected_tag_checks(driver, seen_urls)
+
         # Summary first-ish line for the report header.
         summary = CheckResult(
             name="Tags detected",
@@ -119,7 +202,8 @@ def run_tag_inventory_audit(url: str) -> List[CheckResult]:
                     else "No known analytics/advertising tags detected"),
             severity=Severity.INFO,
         )
-        results.insert(0, summary)
+        # Order in report: summary (INFO), scored gates, then per-vendor inventory.
+        results = [summary, *scored, *results]
 
     except WebDriverException as exc:
         results.append(failed_check("tag_inventory", f"Driver error: {exc}", Severity.HIGH))

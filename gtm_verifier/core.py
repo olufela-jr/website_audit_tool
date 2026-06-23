@@ -6,7 +6,7 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -77,6 +77,10 @@ def make_driver(performance_logging: bool = False) -> webdriver.Chrome:
         opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     driver = webdriver.Chrome(options=opts)
+    # Don't let a slow/hostile site hang an audit indefinitely — fail fast.
+    # Raises TimeoutException (a WebDriverException) from driver.get(), which the
+    # audits already handle.
+    driver.set_page_load_timeout(45)
     # Mask navigator.webdriver so GTM consent/detection code behaves normally
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
@@ -207,12 +211,114 @@ def failed_check(name: str, detail: str, severity: Severity = Severity.HIGH) -> 
 
 # ── Interaction helpers ───────────────────────────────────────────────────────
 
+# Common CMP "accept all" controls, tried after the site-specific selector.
+_CONSENT_SELECTORS = [
+    "#onetrust-accept-btn-handler",                            # OneTrust
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",  # Cookiebot
+    "#CybotCookiebotDialogBodyButtonAccept",                   # Cookiebot (older)
+    ".qc-cmp2-summary-buttons button[mode='primary']",         # Quantcast
+    "#didomi-notice-agree-button",                             # Didomi
+    "button.fc-cta-consent",                                   # Google Funding Choices
+    "[aria-label='Accept all']", "[aria-label='Allow all']",
+]
+# Visible button/link text (lower-cased) signalling an accept-all control.
+_CONSENT_TEXTS = [
+    "accept all", "allow all", "accept cookies", "allow cookies",
+    "accept and continue", "yes, i'm happy", "i'm happy",
+    "i accept", "agree and close", "yes, i agree", "agree", "got it",
+    "accept", "allow",
+]
+# One in-page sweep: try each selector, then match visible control text.
+# Returns the selector/label that was clicked, or null if nothing matched.
+_ACCEPT_JS = r"""
+const selectors = arguments[0], texts = arguments[1];
+function clickable(el){
+  if(!el || el.disabled) return false;
+  const s = getComputedStyle(el);
+  return s.display!=='none' && s.visibility!=='hidden' && el.offsetParent!==null;
+}
+for (const sel of selectors){
+  try { const el = document.querySelector(sel); if(clickable(el)){ el.click(); return sel; } } catch(e){}
+}
+const els = document.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']");
+for (const el of els){
+  const label = (el.innerText || el.value || '').trim().toLowerCase();
+  if(!label || label.length > 40 || !clickable(el)) continue;
+  if(texts.some(t => label === t || label.startsWith(t))){ el.click(); return label; }
+}
+return null;
+"""
+
+
 def accept_consent(driver: webdriver.Chrome) -> None:
-    """Click the consent accept button if it appears. Silently skips if absent."""
+    """Best-effort dismissal of a cookie/consent banner by clicking an
+    'accept all' control. Tries the site-specific selector from config first,
+    then common CMP selectors, then visible button text — in the top document
+    and inside any consent iframes (Sourcepoint, TrustArc, etc.). Polls until
+    something is clicked or the timeout elapses, then silently gives up."""
+    selectors = [s for s in [config.CONSENT_ACCEPT_BUTTON, *_CONSENT_SELECTORS] if s]
+    deadline = time.monotonic() + (config.DEFAULT_TIMEOUT or 10)
+    while time.monotonic() < deadline:
+        if _sweep_all_frames(driver, selectors):
+            return
+        time.sleep(0.3)
+
+
+def _sweep(driver: webdriver.Chrome, selectors: List[str]) -> bool:
+    """Run one accept-control sweep in the current browsing context."""
     try:
-        _click(driver, config.CONSENT_ACCEPT_BUTTON)
-    except (TimeoutException, NoSuchElementException):
-        pass
+        return bool(driver.execute_script(_ACCEPT_JS, selectors, _CONSENT_TEXTS))
+    except WebDriverException:
+        return False
+
+
+def _sweep_all_frames(driver: webdriver.Chrome, selectors: List[str]) -> bool:
+    """Sweep the top document, then any iframes (CMP-looking ones first).
+    Selenium can enter cross-origin frames that page JS cannot reach."""
+    if _sweep(driver, selectors):
+        return True
+    for frame in _candidate_frames(driver):
+        hit = False
+        try:
+            driver.switch_to.frame(frame)
+            hit = _sweep(driver, selectors)
+        except WebDriverException:
+            hit = False
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+        if hit:
+            return True
+    return False
+
+
+_CMP_FRAME_HINTS = (
+    "consent", "privacy", "cmp", "gdpr", "onetrust", "sp_message",
+    "cookie", "didomi", "trustarc", "sourcepoint",
+)
+
+
+def _candidate_frames(driver: webdriver.Chrome) -> List:
+    """Return up to 12 iframes, CMP-looking ones first, to limit frame switching."""
+    try:
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+    except WebDriverException:
+        return []
+    scored = []
+    for fr in frames:
+        try:
+            attrs = " ".join(
+                a for a in (fr.get_attribute("id"), fr.get_attribute("title"),
+                            fr.get_attribute("src")) if a
+            ).lower()
+        except WebDriverException:
+            attrs = ""
+        cmpish = any(hint in attrs for hint in _CMP_FRAME_HINTS)
+        scored.append((0 if cmpish else 1, fr))
+    scored.sort(key=lambda pair: pair[0])
+    return [fr for _, fr in scored[:12]]
 
 
 def _click(driver: webdriver.Chrome, selector: str) -> None:

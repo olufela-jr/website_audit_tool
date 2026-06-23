@@ -1,0 +1,85 @@
+# Palm-View Sparkling Water Co. — verified configuration.
+#
+# Every selector below was crawled from the live site and confirmed by loading
+# the page in Chrome (see notes per slot). Run with:
+#     python run.py --config palm_view_config.yaml
+#
+# IMPORTANT — site event model (affects journey results, not selectors):
+# The site is server-rendered. GA4 events are emitted two ways:
+#   1. On page load, via an inline `payload.events[]` array that is pushed to the
+#      dataLayer (e.g. view_item_list on /shop, view_item on /product/N,
+#      view_cart on /cart, purchase on /order/N, plus init + page_view globally).
+#   2. On click, via inline onclick handlers (add_to_cart, remove_from_cart,
+#      select_promotion, generate_lead, sign_up).
+# The onclick events fire immediately BEFORE a full-page navigation, which resets
+# window.dataLayer on the destination page. The current journeys poll the
+# post-navigation dataLayer, so they will miss add_to_cart / select_promotion /
+# generate_lead / sign_up even though the tags are correct. Fixing that needs a
+# journey change (capture via CDP network, or read the dataLayer before nav) —
+# the selectors here are correct regardless.
+
+site:
+  base_url: "https://palm-view-sparkling-water-co-948395720075.asia-south1.run.app"
+  order_confirmation_url: "https://palm-view-sparkling-water-co-948395720075.asia-south1.run.app/order/1"
+
+tags:
+  gtm_id: "GTM-K4BLC735"     # confirmed live in page source + google_tag_manager
+  ga4_id: "G-JXWM0TX7FS"     # loaded by GTM at runtime
+
+timeouts:
+  default: 10       # seconds — WebDriverWait for DOM elements
+  event_poll: 15    # seconds — dataLayer event polling
+
+selectors:
+  consent:
+    # GTM-injected "ClearCookie" CMP banner (#clearcookie-banner). It overlays the
+    # page and intercepts clicks until dismissed, so accepting it is mandatory.
+    accept_button: ".clearcookie-button--accept-all"   # verified: clickable, dismisses banner
+
+  shop:
+    # Product tiles are anchors to /product/N (38 on the listing). Clicking one
+    # navigates to the PDP. view_item_list fires on listing load.
+    product_card: "a[href^='/product/']"               # verified: 38 matches
+
+  product_detail:
+    # Add-to-cart is a POST form (action="/product/N/add"). The submit button has
+    # an onclick that pushes add_to_cart, then the form navigates to /cart.
+    add_to_cart: "form[action$='/add'] button[type='submit']"   # verified: 1 match
+
+  cart:
+    # Remove is a POST form (action="/cart/items/N/remove") with an onclick that
+    # pushes remove_from_cart.
+    remove_button: "form[action$='/remove'] button[type='submit']"   # verified: 1 match
+    proceed_to_checkout: "a[href='/checkout']"                       # verified: 1 match
+
+  checkout:
+    address_field: "input[name='deliveryAddress']"     # verified (was 'address' — wrong)
+    emirate_field: "select[name='emirate']"            # verified (unchanged from original)
+
+  subscribe:
+    # Plan cards are anchors to /shop whose onclick pushes select_promotion +
+    # generate_lead + sign_up together (3 cards on /subscribe).
+    plan_card: "a[onclick*='select_promotion']"        # verified: 3 matches
+    # NOTE: There is no separate email-capture lead form on this site — the lead
+    # events fire from the plan card above. These two slots point at the footer
+    # newsletter form so the journey doesn't crash, but generate_lead is NOT
+    # emitted here; it comes from plan_card.
+    form_email: "form[action='/subscribe'] input[type='email']"
+    form_submit: "form[action='/subscribe'] button[type='submit']"
+
+  contact:
+    # POST form to /contact. NOTE: this site emits NO form_start /
+    # form_submit_error / form_submit dataLayer events, so those journey checks
+    # will fail regardless of selectors — the events simply don't exist here.
+    first_field: "input[name='name']"                  # verified
+    name_field: "input[name='name']"                   # verified
+    email_field: "input[name='email']"                 # verified
+    message_field: "textarea[name='message']"          # verified
+    submit_button: "form[action='/contact'] button[type='submit']"   # verified (was '.contact' — wrong)
+
+  search:
+    # Search lives ONLY on /shop (GET form, action="/shop", input name="q").
+    # NOTE: journey_search loads BASE_URL (homepage), which has no search box, so
+    # that journey needs to navigate to /shop first to exercise this.
+    input: "input[name='q']"                           # verified on /shop
+    submit: "form[action='/shop'] button[type='submit']"   # verified on /shop
