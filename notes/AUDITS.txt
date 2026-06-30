@@ -120,24 +120,46 @@ How each check works:
     After page load but BEFORE clicking accept, polls the CDP performance
     log for GA4 collect requests (Network.requestWillBeSent events where
     the URL contains /collect and has v=2). Polls for up to 5 seconds.
-    PASS = no collect requests observed before consent interaction.
-    FAIL = collect request(s) fired — GA4 is tracking before consent.
-           Reports which event names (en param) were sent.
+
+    A collect request before consent is NOT automatically a violation: with
+    Consent Mode in a default-denied state, GA4 sends cookieless pings (gcs
+    shows analytics_storage denied) by design — this is compliant. So each
+    pre-consent request is inspected by its gcs analytics_storage digit
+    (G + version + ad_storage + analytics_storage; e.g. G100 = denied,
+    G111 = granted).
+    PASS = no collect requests, OR every pre-consent request has
+           analytics_storage denied (compliant cookieless pings).
+    FAIL = any request fired with analytics_storage granted, or with no
+           Consent Mode signal at all (gcs absent) — genuine tracking
+           before consent. Reports the event names and gcs values.
 
   Post-consent update  [HIGH]
-    Clicks the accept button (config.consent.accept_button selector).
-    Then polls window.dataLayer for up to 8 seconds looking for any of
-    these consent update event names:
-      consent_update, gtm_consent_update, clearcookie_save_preferences,
-      CookieInformationConsentGiven, cookieyes-consent-update
-    Also handles the GTM nested push pattern: {"value": {"event": "..."}}
-    If no dataLayer event is found, falls back to checking whether new
-    collect requests appeared after the click.
-    PASS (primary)  = a consent update event appeared in dataLayer.
-    PASS (fallback) = collect requests fired post-consent (grant sent
-                      directly via gtag without a dataLayer event).
-    FAIL = no consent event and no collect requests — accept button
-           selector is wrong or CMP is not integrated with GTM/GA4.
+    Clicks the accept button (config.consent.accept_button selector), then
+    verifies that analytics_storage actually transitions to GRANTED — the real
+    proof that consent propagated to Consent Mode.
+
+    Two signals are gathered after the click:
+      1. dataLayer consent_update event — polled for up to 8 seconds across
+         known event names (consent_update, gtm_consent_update,
+         clearcookie_save_preferences, CookieInformationConsentGiven,
+         cookieyes-consent-update) and the GTM nested {"value":{"event":...}}
+         pattern. This is only a SUPPORTING signal.
+      2. gcs state of post-consent collect requests — the AUTHORITATIVE signal.
+
+    The mere existence of post-consent collect requests is NOT proof of a
+    grant: Consent Mode keeps sending cookieless (denied) pings regardless, so
+    "any collect = pass" would mask a CMP that never grants analytics_storage.
+
+    PASS (authoritative) = a post-consent collect request shows
+                           analytics_storage granted (gcs third digit = 1).
+                           Reports the denied → granted transition.
+    PASS (weak)          = no post-consent collect to inspect, but a
+                           consent_update event fired in dataLayer.
+    FAIL = collect requests fired post-accept but analytics_storage never
+           became granted (CMP not propagating the grant), OR no consent event
+           and no collect requests at all (accept selector wrong / CMP not
+           integrated). A consent_update event does NOT rescue a still-denied
+           gcs.
 
 --------------------------------------------------------------------------------
 3. network_audit
@@ -180,13 +202,16 @@ How each check works:
   Consent state (gcs)  [HIGH]
     Extracts the gcs parameter which encodes the Consent Mode state at
     the time each request was sent.
-    Format: G followed by digits — each digit is 1=granted or 0=denied
-    for the signals: ad_storage, analytics_storage, ad_user_data,
-    ad_personalization (in that order).
+    Format: G + [version flag] + [ad_storage] + [analytics_storage], where
+    each signal digit is 1=granted or 0=denied. The first digit after G is a
+    version/active flag (always 1 when Consent Mode is on), NOT a signal.
+    Only two signals are carried in gcs; ad_user_data and ad_personalization
+    are encoded separately in the gcd parameter and are not decoded here.
     Examples:
-      G100 = all denied
-      G101 = analytics_storage granted, others denied
-      G111 = all granted
+      G100 = ad_storage denied, analytics_storage denied
+      G101 = ad_storage denied, analytics_storage granted
+      G110 = ad_storage granted, analytics_storage denied
+      G111 = ad_storage granted, analytics_storage granted
     PASS = gcs present; reports raw value and decoded interpretation.
     FAIL = gcs absent — Consent Mode signals not reaching collect calls.
 

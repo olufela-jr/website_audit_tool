@@ -30,6 +30,19 @@
     .error { background: #fee2e2; color: #991b1b; padding: .7rem 1rem; border-radius: 8px; }
     .note { color: #888; font-size: .85rem; margin-top: 1.5rem; }
 
+    /* Authorized stream — visually distinct from the public stream */
+    fieldset.authorized { border-color: #c084fc; background: rgba(192, 132, 252, .06); }
+    fieldset.authorized legend { color: #7c3aed; }
+    fieldset.authorized legend::before { content: "🔒 "; }
+    .access-toggle {
+      display: flex; align-items: flex-start; gap: .55rem;
+      background: rgba(124, 58, 237, .09); border-radius: 6px;
+      padding: .55rem .7rem; margin: 0 0 .7rem;
+    }
+    .access-toggle label { font-size: .9rem; }
+    .check input:disabled + label { color: #aaa; }
+    .empty-note { color: #aaa; font-size: .85rem; font-style: italic; margin: .2rem 0 0; }
+
     /* Running overlay */
     #overlay {
       display: none; position: fixed; inset: 0; z-index: 50;
@@ -60,15 +73,27 @@
            value="{{ url or '' }}" autofocus required>
 
     {% for group in groups %}
-    <fieldset>
+    <fieldset class="{{ 'authorized' if group.requires_access else 'public' }}" data-stream="{{ group.id }}">
       <legend>{{ group.title }}</legend>
       <p class="blurb">{{ group.blurb }}</p>
+      {% if group.requires_access and group['items'] %}
+      <div class="access-toggle">
+        <input type="checkbox" id="authorized" name="authorized">
+        <label for="authorized"><strong>I have authorized access to this site</strong>
+          &mdash; enable these audits. Without it they're reported as “access required”.</label>
+      </div>
+      {% endif %}
       {% for key, label, _fn in group['items'] %}
       <div class="check">
-        <input type="checkbox" id="{{ key }}" name="{{ key }}" {{ 'checked' if group.default else '' }}>
+        <input type="checkbox" id="{{ key }}" name="{{ key }}"
+               {{ 'checked' if group.default else '' }}
+               {{ 'disabled' if group.requires_access else '' }}>
         <label for="{{ key }}">{{ label }}</label>
       </div>
       {% endfor %}
+      {% if not group['items'] %}
+      <p class="empty-note">No audits available in this stream yet.</p>
+      {% endif %}
     </fieldset>
     {% endfor %}
 
@@ -87,6 +112,22 @@
   <script>
     (function () {
       var form = document.getElementById('audit-form');
+
+      // Authorized-stream audits are only selectable once the operator confirms
+      // access. The backend enforces this too — this is just UX.
+      var access = document.getElementById('authorized');
+      if (access) {
+        var gated = document.querySelectorAll('fieldset.authorized .check input[type=checkbox]');
+        var sync = function () {
+          gated.forEach(function (cb) {
+            cb.disabled = !access.checked;
+            if (!access.checked) { cb.checked = false; }
+          });
+        };
+        access.addEventListener('change', sync);
+        sync();
+      }
+
       form.addEventListener('submit', function () {
         var labels = [];
         form.querySelectorAll('input[type=checkbox]:checked').forEach(function (cb) {

@@ -1,11 +1,16 @@
 """
-SEO & metadata audit — publicly observable, no site access required.
+SEO & metadata audit — PUBLIC stream (outside-in, no access required).
 
 Fetches the page's server-rendered HTML (what crawlers see) plus robots.txt and
 sitemap.xml, and checks the on-page SEO fundamentals: title, meta description,
 canonical, Open Graph, viewport, headings, structured data, indexability,
-hreflang and language. Pure HTTP — no browser, no third-party deps (uses lxml,
-already a dependency).
+hreflang and language. SEO/metadata is public by definition, so this is a public
+audit.
+
+Fetching goes through `resilient_fetch`: a fast raw HTTP request, falling back to
+an in-browser fetch when a WAF/bot filter blocks the raw client (the content is
+still public — only the raw transport was refused). It is SKIPPED (score-neutral)
+only if the page can't be retrieved by either path — see _UNREACHABLE.
 """
 
 import json
@@ -14,8 +19,15 @@ from urllib.parse import urljoin, urlparse
 
 from lxml import html as lxml_html
 
-from core import CheckResult, Severity, failed_check
-from httpfetch import fetch
+from browser_fetch import resilient_fetch as fetch
+from core import CheckResult, Severity, failed_check, skip_check
+
+# Used only when both the raw and in-browser fetch fail — a transport dead-end,
+# not a site defect, so it is skipped (never scored as a failure).
+_UNREACHABLE = (
+    "Not assessed — the page could not be retrieved (raw and in-browser "
+    "fetch both failed)."
+)
 
 
 def _ok(name, detail, sev=Severity.MEDIUM) -> CheckResult:
@@ -29,14 +41,27 @@ def _bad(name, detail, sev=Severity.MEDIUM) -> CheckResult:
 def run_seo_audit(url: str) -> List[CheckResult]:
     page = fetch(url)
     if not page.ok:
-        return [failed_check("SEO fetch", f"Could not fetch page: {page.error}", Severity.HIGH)]
+        return [skip_check("SEO & metadata", _UNREACHABLE, Severity.HIGH)]
 
     try:
         doc = lxml_html.fromstring(page.text)
     except Exception as exc:  # noqa: BLE001
-        return [failed_check("SEO parse", f"Could not parse HTML: {exc}", Severity.HIGH)]
+        return [failed_check(
+            "SEO parse",
+            f"Retrieved {len(page.text)} bytes via {page.source} (HTTP {page.status}) "
+            f"but the HTML could not be parsed: {exc}",
+            Severity.HIGH,
+        )]
 
-    results: List[CheckResult] = []
+    # Provenance row so each finding below can be read against what was fetched
+    # (source, status, size) — distinguishing a real gap from a thin/blocked page.
+    results: List[CheckResult] = [CheckResult(
+        name="Fetch",
+        event=None,
+        passed=True,
+        detail=f"{page.source} · HTTP {page.status} · {len(page.text)} bytes HTML · final URL {page.final_url}",
+        severity=Severity.INFO,
+    )]
 
     def first(xpath):
         found = doc.xpath(xpath)

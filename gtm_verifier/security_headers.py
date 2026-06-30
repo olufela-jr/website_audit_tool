@@ -1,16 +1,29 @@
 """
-Security headers audit — publicly observable, no site access required.
+Security headers audit — PUBLIC stream (outside-in, no access required).
 
 Inspects the HTTP response headers of the page for the common defensive headers
 (HSTS, CSP, anti-clickjacking, MIME sniffing, referrer/permissions policy) and
-checks that HTTP upgrades to HTTPS. Pure HTTP, no browser.
+checks that HTTP upgrades to HTTPS. Response headers are publicly observable, so
+this is a public audit.
+
+Fetching goes through `resilient_fetch`: a fast raw HTTP request, falling back to
+an in-browser same-origin fetch (which can read response headers) when a WAF/bot
+filter refuses the raw client. It is SKIPPED (score-neutral) only if neither path
+can reach the site — a defended perimeter must never be scored as insecure.
 """
 
 from typing import List
 from urllib.parse import urlparse
 
-from core import CheckResult, Severity, failed_check
-from httpfetch import fetch
+from browser_fetch import resilient_fetch as fetch
+from core import CheckResult, Severity, skip_check
+
+# Used only when both the raw and in-browser fetch fail — a transport dead-end,
+# not a site defect, so it is skipped (never scored as a failure).
+_UNREACHABLE = (
+    "Not assessed — the site could not be reached (raw and in-browser "
+    "fetch both failed)."
+)
 
 
 def _ok(name, detail, sev) -> CheckResult:
@@ -24,19 +37,45 @@ def _bad(name, detail, sev) -> CheckResult:
 def run_security_headers_audit(url: str) -> List[CheckResult]:
     resp = fetch(url)
     if not resp.ok:
-        return [failed_check("Security fetch", f"Could not fetch site: {resp.error}", Severity.HIGH)]
+        return [skip_check("Security headers", _UNREACHABLE, Severity.HIGH)]
 
     h = resp.headers
-    results: List[CheckResult] = []
+    # Guard against a false-negative sweep: if the site was reached but no headers
+    # were captured, every header would "fail". That's a measurement gap, not an
+    # insecure site — skip and say so rather than report seven false failures.
+    if not h:
+        return [skip_check(
+            "Security headers",
+            f"Reached the site ({resp.source}, HTTP {resp.status}) but no response "
+            f"headers were captured — cannot assess. Re-run to retry.",
+            Severity.HIGH,
+        )]
+
+    src = resp.source
+    nh = len(h)
+    # Provenance row so every failure below can be read against what was actually
+    # observed (how it was fetched, the status, and how many headers were seen).
+    where = f"via {src}; checked {nh} response headers"
+    results: List[CheckResult] = [CheckResult(
+        name="Fetch",
+        event=None,
+        passed=True,
+        detail=f"{src} · HTTP {resp.status} · {nh} response headers · final URL {resp.final_url}",
+        severity=Severity.INFO,
+    )]
     final_https = urlparse(resp.final_url).scheme == "https"
 
     # ── HTTPS enforced ───────────────────────────────────────────────────────
     if url.startswith("http://") and final_https:
         results.append(_ok("HTTPS upgrade", f"HTTP redirected to {resp.final_url}", Severity.HIGH))
     elif final_https:
-        results.append(_ok("HTTPS", "Served over HTTPS", Severity.HIGH))
+        results.append(_ok("HTTPS", f"Served over HTTPS (final URL: {resp.final_url})", Severity.HIGH))
     else:
-        results.append(_bad("HTTPS", "Final response is not HTTPS", Severity.CRITICAL))
+        results.append(_bad(
+            "HTTPS",
+            f"Final response is not HTTPS — served over plain HTTP (final URL: {resp.final_url}).",
+            Severity.CRITICAL,
+        ))
 
     # ── HSTS (only meaningful over HTTPS) ────────────────────────────────────
     hsts = h.get("strict-transport-security")
@@ -45,7 +84,12 @@ def run_security_headers_audit(url: str) -> List[CheckResult]:
     elif hsts:
         results.append(_ok("HSTS", hsts, Severity.HIGH))
     else:
-        results.append(_bad("HSTS", "No Strict-Transport-Security header", Severity.HIGH))
+        results.append(_bad(
+            "HSTS",
+            f"No 'strict-transport-security' header in the response ({where}). "
+            "Site is HTTPS, so HSTS should be set to block protocol-downgrade attacks.",
+            Severity.HIGH,
+        ))
 
     # ── Content-Security-Policy ──────────────────────────────────────────────
     csp = h.get("content-security-policy")
@@ -53,7 +97,10 @@ def run_security_headers_audit(url: str) -> List[CheckResult]:
         results.append(_ok("Content-Security-Policy", f"present ({len(csp)} chars)", Severity.HIGH))
     else:
         results.append(_bad(
-            "Content-Security-Policy", "No CSP header (XSS / injection exposure)", Severity.HIGH,
+            "Content-Security-Policy",
+            f"No 'content-security-policy' header in the response ({where}) — "
+            "nothing constraining script/resource origins (XSS / injection exposure).",
+            Severity.HIGH,
         ))
 
     # ── Clickjacking protection ──────────────────────────────────────────────
@@ -62,12 +109,16 @@ def run_security_headers_audit(url: str) -> List[CheckResult]:
     if xfo or frame_ancestors:
         results.append(_ok(
             "Clickjacking protection",
-            xfo or "CSP frame-ancestors", Severity.MEDIUM,
+            f"x-frame-options: {xfo}" if xfo else "CSP frame-ancestors directive present",
+            Severity.MEDIUM,
         ))
     else:
         results.append(_bad(
             "Clickjacking protection",
-            "No X-Frame-Options and no CSP frame-ancestors", Severity.MEDIUM,
+            f"Neither 'x-frame-options' nor a CSP 'frame-ancestors' directive present "
+            f"({where}; CSP {'present but without frame-ancestors' if csp else 'absent'}) — "
+            "the page can be framed for clickjacking.",
+            Severity.MEDIUM,
         ))
 
     # ── MIME sniffing ────────────────────────────────────────────────────────
@@ -75,20 +126,25 @@ def run_security_headers_audit(url: str) -> List[CheckResult]:
     if "nosniff" in xcto:
         results.append(_ok("X-Content-Type-Options", "nosniff", Severity.MEDIUM))
     else:
-        results.append(_bad("X-Content-Type-Options", "Missing 'nosniff'", Severity.MEDIUM))
+        results.append(_bad(
+            "X-Content-Type-Options",
+            f"'x-content-type-options' is {repr(xcto) if xcto else 'absent'}, expected 'nosniff' "
+            f"({where}) — browsers may MIME-sniff responses.",
+            Severity.MEDIUM,
+        ))
 
     # ── Referrer-Policy ──────────────────────────────────────────────────────
     ref = h.get("referrer-policy")
     results.append(
         _ok("Referrer-Policy", ref, Severity.LOW) if ref
-        else _bad("Referrer-Policy", "No Referrer-Policy header", Severity.LOW)
+        else _bad("Referrer-Policy", f"No 'referrer-policy' header in the response ({where}).", Severity.LOW)
     )
 
     # ── Permissions-Policy ───────────────────────────────────────────────────
     pp = h.get("permissions-policy")
     results.append(
         _ok("Permissions-Policy", "present", Severity.LOW) if pp
-        else _bad("Permissions-Policy", "No Permissions-Policy header", Severity.LOW)
+        else _bad("Permissions-Policy", f"No 'permissions-policy' header in the response ({where}).", Severity.LOW)
     )
 
     # ── Version disclosure (informational) ───────────────────────────────────

@@ -24,7 +24,7 @@ from core import (
     make_driver,
     skip_check,
 )
-from network import extract_collect_requests
+from network import extract_collect_requests, gcs_analytics_storage_granted
 import config
 
 
@@ -80,23 +80,181 @@ def _detect_cmp(driver: webdriver.Chrome) -> Optional[str]:
     return None
 
 
-def _get_consent_mode_state(driver: webdriver.Chrome) -> Optional[dict]:
+def _gtag_args(entry) -> Optional[list]:
     """
-    Return the first gtag consent default state dict from window.dataLayer,
-    or None if not found.  Handles both list-form pushes
-    (['consent', 'default', {...}]) and any dict-based variants.
+    Normalise a dataLayer entry into the positional arguments of a gtag() call,
+    or None if it is not one.
+
+    gtag() does `dataLayer.push(arguments)`, pushing the function's arguments
+    object. Because that object is array-like but NOT a true Array, Selenium /
+    JSON serialisation renders it either as:
+      - a list  ['consent', 'default', {...}]                     (true Array), or
+      - a dict  {'0': 'consent', '1': 'default', '2': {...}}      (arguments object)
+    A normal dataLayer.push({...}) has named keys and yields None here.
     """
-    data_layer = driver.execute_script("return window.dataLayer || []") or []
-    for entry in data_layer:
-        if (
-            isinstance(entry, (list, tuple))
-            and len(entry) >= 3
-            and entry[0] == "consent"
-            and entry[1] == "default"
-            and isinstance(entry[2], dict)
-        ):
-            return entry[2]
+    if isinstance(entry, (list, tuple)):
+        return list(entry)
+    if isinstance(entry, dict) and "0" in entry:
+        args, i = [], 0
+        while str(i) in entry:
+            args.append(entry[str(i)])
+            i += 1
+        return args
     return None
+
+
+def _extract_consent_default(data_layer) -> Optional[dict]:
+    """
+    Return the first gtag consent-default state dict from a dataLayer list, or
+    None if not found. Matches ('consent', 'default', {...}) in either the
+    list-form or arguments-object (dict) form. Pure helper — unit-testable
+    without a browser.
+    """
+    for entry in data_layer or []:
+        args = _gtag_args(entry)
+        if (
+            args is not None
+            and len(args) >= 3
+            and args[0] == "consent"
+            and args[1] == "default"
+            and isinstance(args[2], dict)
+        ):
+            return args[2]
+    return None
+
+
+def _get_consent_mode_state(driver: webdriver.Chrome) -> Optional[dict]:
+    """Read window.dataLayer and return the gtag consent-default state dict."""
+    data_layer = driver.execute_script("return window.dataLayer || []") or []
+    return _extract_consent_default(data_layer)
+
+
+def _pre_consent_firing_result(pre_requests: List[dict]) -> CheckResult:
+    """
+    Classify pre-consent GA4 collect requests into a "Pre-consent GA4 firing"
+    CheckResult.
+
+    A collect request before consent is NOT automatically a violation. With
+    Consent Mode in a default-denied state, GA4 sends cookieless pings (gcs
+    shows analytics_storage denied) by design — that is compliant. The real
+    violation is analytics_storage being *granted*, or no Consent Mode signal
+    at all (gcs absent/unparseable), on a request that fired before the user
+    made a choice.
+    """
+    if not pre_requests:
+        return CheckResult(
+            name="Pre-consent GA4 firing",
+            event=None,
+            passed=True,
+            detail="No collect requests observed before consent interaction",
+            severity=Severity.CRITICAL,
+        )
+
+    violations, compliant = [], []
+    for r in pre_requests:
+        en  = r["params"].get("en", "?")
+        gcs = r["params"].get("gcs", "")
+        if gcs_analytics_storage_granted(gcs) is False:
+            compliant.append(f"{en} (gcs={gcs})")
+        else:
+            # analytics_storage granted, or no Consent Mode signal at all
+            violations.append(f"{en} (gcs={gcs or 'absent'})")
+
+    if violations:
+        return failed_check(
+            "Pre-consent GA4 firing",
+            (
+                f"{len(violations)} collect request(s) fired before consent with "
+                f"analytics_storage granted or no Consent Mode signal: "
+                f"[{', '.join(violations)}]"
+            ),
+            Severity.CRITICAL,
+        )
+
+    return CheckResult(
+        name="Pre-consent GA4 firing",
+        event=None,
+        passed=True,
+        detail=(
+            f"{len(compliant)} cookieless Consent Mode ping(s) before consent "
+            f"with analytics_storage denied — compliant: [{', '.join(compliant)}]"
+        ),
+        severity=Severity.CRITICAL,
+    )
+
+
+def _post_consent_transition_result(
+    pre_requests: List[dict],
+    post_requests: List[dict],
+    consent_update_found: bool,
+) -> CheckResult:
+    """
+    Verify analytics_storage actually transitions to *granted* after the accept
+    click — the real proof that consent propagated.
+
+    The authoritative signal is the gcs state of post-consent collect requests.
+    Neither a consent_update dataLayer event nor the mere existence of
+    post-consent collect requests proves analytics was granted: Consent Mode
+    keeps sending cookieless (denied) pings regardless, so "any collect = pass"
+    would mask a CMP that is not wired to Consent Mode.
+    """
+    post_granted = [
+        r for r in post_requests
+        if gcs_analytics_storage_granted(r["params"].get("gcs", "")) is True
+    ]
+
+    if post_granted:
+        gcs_vals = sorted({r["params"].get("gcs", "") for r in post_granted})
+        pre_granted = any(
+            gcs_analytics_storage_granted(r["params"].get("gcs", "")) is True
+            for r in pre_requests
+        )
+        transition = "already granted pre-consent" if pre_granted else "denied → granted"
+        detail = (
+            f"analytics_storage granted after accept ({transition}); "
+            f"post-consent gcs={', '.join(gcs_vals)}"
+        )
+        if consent_update_found:
+            detail += "; consent_update event also seen in dataLayer"
+        return CheckResult(
+            name="Post-consent update",
+            event=None,
+            passed=True,
+            detail=detail,
+            severity=Severity.HIGH,
+        )
+
+    if post_requests:
+        gcs_seen = sorted({r["params"].get("gcs") or "absent" for r in post_requests})
+        detail = (
+            f"{len(post_requests)} collect request(s) fired after accepting consent but "
+            f"analytics_storage never became granted (gcs={', '.join(gcs_seen)}) — "
+            f"the CMP is not propagating the grant to Consent Mode"
+        )
+        if consent_update_found:
+            detail += "; a consent_update event fired but gcs did not update"
+        return failed_check("Post-consent update", detail, Severity.HIGH)
+
+    if consent_update_found:
+        return CheckResult(
+            name="Post-consent update",
+            event=None,
+            passed=True,
+            detail=(
+                "consent_update event fired in dataLayer after accepting consent; "
+                "no post-consent collect request seen to confirm the gcs grant"
+            ),
+            severity=Severity.HIGH,
+        )
+
+    return failed_check(
+        "Post-consent update",
+        (
+            "No consent_update event and no collect requests after accepting consent — "
+            "check config.CONSENT_ACCEPT_BUTTON selector"
+        ),
+        Severity.HIGH,
+    )
 
 
 # ── Public audit ──────────────────────────────────────────────────────────────
@@ -182,27 +340,12 @@ def run_consent_audit(url: str) -> List[CheckResult]:
                 ))
 
         # ── Check 4: Pre-consent GA4 firing ───────────────────────────────
-        # Poll with a short timeout — on compliant sites nothing fires, so we
-        # should not wait the full event timeout.
+        # Poll with a short timeout — on compliant sites the pre-consent pings
+        # are denied, so we should not wait the full event timeout. The
+        # compliant-vs-violation classification lives in a pure helper so it
+        # can be unit-tested without a browser.
         pre_requests = extract_collect_requests(driver, timeout=5.0)
-        if pre_requests:
-            event_names = [r["params"].get("en", "?") for r in pre_requests]
-            results.append(failed_check(
-                "Pre-consent GA4 firing",
-                (
-                    f"{len(pre_requests)} collect request(s) fired before consent: "
-                    f"events=[{', '.join(event_names)}]"
-                ),
-                Severity.CRITICAL,
-            ))
-        else:
-            results.append(CheckResult(
-                name="Pre-consent GA4 firing",
-                event=None,
-                passed=True,
-                detail="No collect requests observed before consent interaction",
-                severity=Severity.CRITICAL,
-            ))
+        results.append(_pre_consent_firing_result(pre_requests))
 
         # ── Check 5: Post-consent update ──────────────────────────────────
         pre_accept_idx = get_datalayer_length(driver)
@@ -239,34 +382,12 @@ def run_consent_audit(url: str) -> List[CheckResult]:
 
         post_requests = extract_collect_requests(driver, timeout=5.0)
 
-        if consent_update_found:
-            results.append(CheckResult(
-                name="Post-consent update",
-                event=None,
-                passed=True,
-                detail="consent_update event fired in dataLayer after accepting consent",
-                severity=Severity.HIGH,
-            ))
-        elif post_requests:
-            results.append(CheckResult(
-                name="Post-consent update",
-                event=None,
-                passed=True,
-                detail=(
-                    f"No consent_update event, but {len(post_requests)} collect request(s) "
-                    "fired post-consent — grant likely sent directly via gtag()"
-                ),
-                severity=Severity.HIGH,
-            ))
-        else:
-            results.append(failed_check(
-                "Post-consent update",
-                (
-                    "No consent_update in dataLayer and no collect requests after accepting consent — "
-                    "check config.CONSENT_ACCEPT_BUTTON selector"
-                ),
-                Severity.HIGH,
-            ))
+        # Authoritative check: did analytics_storage actually flip to granted
+        # across the accept click? The consent_update dataLayer event is only a
+        # supporting signal. Classification lives in a pure, unit-testable helper.
+        results.append(_post_consent_transition_result(
+            pre_requests, post_requests, consent_update_found
+        ))
 
     except WebDriverException as exc:
         results.append(failed_check(

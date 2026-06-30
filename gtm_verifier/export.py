@@ -3,14 +3,14 @@ PowerPoint export for GA4/GTM audit results.
 """
 
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.dml.color import RGBColor
 
-from core import CheckResult, score_checks
+from core import CheckResult, Severity, score_checks
 
 # Maximum check rows per slide. Audits with more checks paginate onto
 # additional "(cont.)" slides so nothing is ever silently dropped.
@@ -144,10 +144,11 @@ def _add_audit_slide(
     prs: Presentation,
     title: str,
     checks: List[CheckResult],
-    stats: Tuple[int, int, int, int],
-    score: Tuple[int, int, float],
+    stats: Optional[Tuple[int, int, int, int]] = None,
+    score: Optional[Tuple[int, int, float]] = None,
 ) -> None:
-    """Render one slide: title, score, stats line, and a table of the given checks."""
+    """Render one slide: title, score, stats line, and a table of the given checks.
+    `stats`/`score` are omitted on observation (INFO) slides, which aren't scored."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank layout
 
     # Title
@@ -158,24 +159,28 @@ def _add_audit_slide(
     p.font.bold = True
     p.font.color.rgb = RGBColor(33, 33, 33)
 
-    # Score badge (top-right)
-    s_passed, s_total, s_pct = score
-    score_box = slide.shapes.add_textbox(Inches(7.2), Inches(0.3), Inches(2.4), Inches(0.6))
-    p = score_box.text_frame.paragraphs[0]
-    p.text = f"{s_pct:.0f}%"
-    p.font.size = Pt(36)
-    p.font.bold = True
-    p.font.color.rgb = _score_color_rgb(s_pct)
-    p.alignment = PP_ALIGN.RIGHT
+    # Score badge (top-right) — omitted on observation slides (nothing to score)
+    if score is not None:
+        s_passed, s_total, s_pct = score
+        score_box = slide.shapes.add_textbox(Inches(7.2), Inches(0.3), Inches(2.4), Inches(0.6))
+        p = score_box.text_frame.paragraphs[0]
+        p.text = f"{s_pct:.0f}%"
+        p.font.size = Pt(36)
+        p.font.bold = True
+        p.font.color.rgb = _score_color_rgb(s_pct)
+        p.alignment = PP_ALIGN.RIGHT
 
-    # Stats line (computed across the whole audit, shown on every slide)
-    passed, failed, skipped, total = stats
+    # Stats line for scored slides; a "not scored" note for observation slides.
     stats_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.95), Inches(9), Inches(0.3))
     p = stats_box.text_frame.paragraphs[0]
-    p.text = (
-        f"{passed} PASS  •  {failed} FAIL  •  {skipped} SKIP  •  {total} Total"
-        f"   |   Score: {s_passed}/{s_total}"
-    )
+    if stats is not None:
+        passed, failed, skipped, total = stats
+        p.text = (
+            f"{passed} PASS  •  {failed} FAIL  •  {skipped} SKIP  •  {total} Total"
+            f"   |   Score: {score[0]}/{score[1]}"
+        )
+    else:
+        p.text = "Observations — context, not scored"
     p.font.size = Pt(12)
     p.font.color.rgb = RGBColor(100, 100, 100)
 
@@ -215,27 +220,40 @@ def _add_audit_slide(
         _set_cell(table.cell(i, 3), detail, size=9, color=_DETAIL_TEXT, fill=row_fill)
 
 
+def _is_observation(check: CheckResult) -> bool:
+    """INFO context with no pass/fail judgement (mirrors the web 'Observations')."""
+    return check.severity == Severity.INFO and not check.skipped
+
+
+def _chunks(seq: List[CheckResult]) -> List[List[CheckResult]]:
+    return [seq[i:i + _ROWS_PER_SLIDE] for i in range(0, len(seq), _ROWS_PER_SLIDE)]
+
+
 def _add_audit_slides(
     prs: Presentation, journey_name: str, checks: List[CheckResult]
 ) -> None:
-    """Add one or more slides for an audit, paginating so no check is dropped."""
-    passed = sum(1 for c in checks if c.passed and not c.skipped)
-    failed = sum(1 for c in checks if not c.passed and not c.skipped)
-    skipped = sum(1 for c in checks if c.skipped)
-    stats = (passed, failed, skipped, len(checks))
+    """Add slides for an audit: scored CHECKS first (PASS/FAIL/SKIP, with the
+    score), then INFO OBSERVATIONS on their own slides (no score). Paginates so
+    no row is dropped."""
+    observations = [c for c in checks if _is_observation(c)]
+    scored = [c for c in checks if not _is_observation(c)]
+
+    passed = sum(1 for c in scored if c.passed and not c.skipped)
+    failed = sum(1 for c in scored if not c.passed and not c.skipped)
+    skipped = sum(1 for c in scored if c.skipped)
+    stats = (passed, failed, skipped, len(scored))
     score = score_checks(checks)
 
-    if not checks:
-        _add_audit_slide(prs, journey_name, [], stats, score)
-        return
-
-    chunks = [
-        checks[i:i + _ROWS_PER_SLIDE]
-        for i in range(0, len(checks), _ROWS_PER_SLIDE)
-    ]
-    for idx, chunk in enumerate(chunks):
+    # Scored checks (always at least one slide, even if empty, to anchor the score)
+    scored_chunks = _chunks(scored) or [[]]
+    for idx, chunk in enumerate(scored_chunks):
         title = journey_name if idx == 0 else f"{journey_name}  (cont.)"
         _add_audit_slide(prs, title, chunk, stats, score)
+
+    # Observations on their own slides — no score, clearly labelled
+    for idx, chunk in enumerate(_chunks(observations)):
+        title = f"{journey_name} — Observations" + ("  (cont.)" if idx else "")
+        _add_audit_slide(prs, title, chunk)
 
 
 def _add_summary_slide(

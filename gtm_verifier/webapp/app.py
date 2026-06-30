@@ -1,9 +1,16 @@
 """
 Tiny local web front end for the GTM / GA4 verifier.
 
-Wraps the three infrastructure audits (analytics, consent, network) — the ones
-that need only a URL and no per-site CSS selectors — behind a small Flask UI:
-enter a URL, pick audits, see an HTML report, download the PowerPoint.
+Audits are split into two streams by what access they require:
+
+  • Public    — outside-in checks on any public URL, no affiliation or access
+                needed (tags, analytics, consent, network). All browser-based.
+  • Authorized — checks that need client-granted access: a server fetch from an
+                allow-listed host, or GTM container access (security headers,
+                SEO). These only run when the operator confirms authorized
+                access; otherwise they are skipped as "access required".
+
+Enter a URL, pick audits, see an HTML report, download the PowerPoint.
 
 Run from the gtm_verifier directory:
     flask --app webapp.app run
@@ -37,32 +44,44 @@ import network  # noqa: E402
 import seo  # noqa: E402
 import security_headers  # noqa: E402
 import tags_inventory  # noqa: E402
-from core import CheckResult, Severity, failed_check, score_checks  # noqa: E402
+from core import CheckResult, Severity, failed_check, score_checks, skip_check  # noqa: E402
 from export import export_to_powerpoint  # noqa: E402
 
 app = Flask(__name__)
 
-# Audits grouped into two tracks for the UI. Each item is (key, label, fn) where
-# fn takes a URL and returns List[CheckResult].
+# Form field the operator ticks to confirm they have authorized access to the
+# target (allow-listed host / GTM container access). Honour system — the tool
+# does not verify it; if access isn't really there the fetch just fails and the
+# audit skips as "access required".
+ACCESS_FIELD = "authorized"
+
+# Audits split into two streams by the access they require. Each item is
+# (key, label, fn) where fn takes a URL and returns List[CheckResult].
+# `requires_access` marks the Authorized stream: gated behind ACCESS_FIELD.
 AUDIT_GROUPS = [
     {
-        "title": "Client / external",
-        "blurb": "Run on any public site — no access or cooperation required.",
+        "id": "public",
+        "title": "Public audit",
+        "blurb": "Outside-in checks anyone can run on a public URL — no affiliation or access required.",
         "default": True,
+        "requires_access": False,
         "items": [
             ("tags", "Tag & pixel inventory", tags_inventory.run_tag_inventory_audit),
             ("seo", "SEO & metadata", seo.run_seo_audit),
-            ("security", "Security headers", security_headers.run_security_headers_audit),
         ],
     },
     {
-        "title": "Analytics implementation",
-        "blurb": "Inspects the site's GA4 / GTM / consent setup — most useful on an implementation you know.",
+        "id": "authorized",
+        "title": "Authorized audit",
+        "blurb": "Implementation, consent, network and security checks — shown only with "
+                 "client-granted access. Tick below to confirm access and enable them.",
         "default": False,
+        "requires_access": True,
         "items": [
             ("analytics", "Analytics setup", analytics.run_analytics_audit),
             ("consent", "Consent & privacy", consent.run_consent_audit),
             ("network", "Network / collect", network.run_network_audit),
+            ("security", "Security headers", security_headers.run_security_headers_audit),
         ],
     },
 ]
@@ -71,6 +90,9 @@ AUDIT_GROUPS = [
 AUDITS: Dict[str, Tuple[str, callable]] = {
     key: (label, fn) for g in AUDIT_GROUPS for key, label, fn in g["items"]
 }
+
+# Keys that belong to the Authorized stream (gated behind ACCESS_FIELD).
+_AUTHORIZED_KEYS = {key for g in AUDIT_GROUPS if g["requires_access"] for key, _l, _fn in g["items"]}
 
 # In-process cache of completed runs so the results page can offer a PowerPoint
 # download without re-running the (slow) browser audits. Fine for a single local
@@ -102,21 +124,25 @@ def _build_view(journey_results: List[Tuple[str, List[CheckResult]]]) -> dict:
         passed, total, pct = score_checks(checks)
         overall_passed += passed
         overall_total += total
-        rows = []
+        # Split into scored CHECKS (PASS/FAIL/SKIP) and INFO OBSERVATIONS so the
+        # UI never mixes graded judgements with neutral context.
+        checks_rows, observations = [], []
         for c in checks:
-            rows.append({
+            row = {
                 "status": _status(c),
                 "name": c.name,
                 "severity": c.severity.value,
                 "detail": c.detail,
                 "event": c.event,
-            })
+            }
+            (observations if row["status"] == "INFO" else checks_rows).append(row)
         audits.append({
             "name": AUDITS.get(name, (name,))[0],
             "passed": passed,
             "total": total,
             "pct": pct,
-            "rows": rows,
+            "checks": checks_rows,
+            "observations": observations,
         })
     overall_pct = (overall_passed / overall_total * 100.0) if overall_total else 0.0
     return {
@@ -146,9 +172,21 @@ def run_audit():
             "index.html", groups=AUDIT_GROUPS, error="Pick at least one audit to run.", url=url
         )
 
+    authorized = bool(request.form.get(ACCESS_FIELD))
+
     journey_results: List[Tuple[str, List[CheckResult]]] = []
     for name in selected:
-        _label, fn = AUDITS[name]
+        label, fn = AUDITS[name]
+        # Authorized-stream audits only run when the operator confirms access.
+        # Without it they're skipped (score-neutral), never failed.
+        if name in _AUTHORIZED_KEYS and not authorized:
+            checks = [skip_check(
+                label,
+                "Not assessed — access required: confirm authorized access to run this audit.",
+                Severity.HIGH,
+            )]
+            journey_results.append((name, checks))
+            continue
         try:
             checks = fn(url)
         except Exception as exc:  # one bad audit shouldn't 500 the whole page

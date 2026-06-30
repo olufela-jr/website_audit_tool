@@ -1,0 +1,304 @@
+================================================================================
+ AUDIT LOGIC REFERENCE  —  what every audit & check actually does, and how to
+ verify it by hand in the browser (DevTools).
+================================================================================
+
+Purpose: cross-check each result against a live inspection so you can validate
+the tool's accuracy. For every check you get: WHAT it asserts, the exact
+DETECTION LOGIC (params / selectors / regex / headers the code really uses),
+the PASS/FAIL rule, the SEVERITY, and HOW TO VERIFY it manually.
+
+--------------------------------------------------------------------------------
+ 0. GROUND RULES (apply to every audit)
+--------------------------------------------------------------------------------
+
+RESULT TYPES
+  PASS  — check ran, site met the bar.            (counts toward score)
+  FAIL  — check ran, site did NOT meet the bar.   (counts toward score)
+  SKIP  — check could not be measured this run.   (NOT scored — "unknown")
+  INFO  — an observation/inventory, never a test. (NOT scored — "context")
+
+SCORING (core.py → score_checks)
+  score = passed / total, where total = checks that are NOT skipped AND NOT INFO.
+  => INFO and SKIP rows never change the %.  Only PASS/FAIL do.
+
+HOW DATA IS GATHERED
+  • Browser audits (tags, analytics, consent, network): real Chrome via Selenium.
+    Network requests are read from the Chrome DevTools Protocol "performance" log
+    (CDP event Network.requestWillBeSent). The dataLayer is read with
+    `window.dataLayer`. JS globals with `typeof window.X`.
+  • Fetch audits (SEO, security): resilient_fetch() — a raw HTTP GET first; if a
+    WAF/bot filter blocks it, it falls back to an in-page fetch() inside Chrome,
+    and reads the navigation response headers from the CDP log. Each result's
+    "Fetch" INFO row tells you which path was used (raw HTTP vs browser).
+  • Consent is auto-accepted on most audits via accept_consent() (clicks a known
+    "accept all" control). The CONSENT audit deliberately does NOT accept first.
+
+GENERAL DEVTOOLS SETUP
+  Open the site, press F12 / ⌥⌘I. Use:
+    • Console  — paste the JS snippets below.
+    • Network  — reload (⌘R) first so load-time requests are captured; use the
+                 filter box (e.g. "collect", "gtm.js"); click a row → Headers/Payload.
+
+
+================================================================================
+ 1. TAG & PIXEL INVENTORY        (module: tags_inventory.py)   [PUBLIC]
+================================================================================
+HOW IT RUNS: loads the page, accepts consent, then accumulates every request URL
+from the CDP log for ~8 seconds, and reads a set of JS globals.
+
+-- SCORED CHECKS ---------------------------------------------------------------
+
+[GTM running]   severity HIGH
+  WHAT: is at least one GTM container live?
+  LOGIC: found_gtm = (GTM- keys of window.google_tag_manager)  ∪
+                     (regex GTM-[A-Z0-9]{4,} found in any captured request URL)
+  PASS: found_gtm non-empty.  Detail lists count + container IDs.
+  VERIFY (Console):
+     Object.keys(window.google_tag_manager || {}).filter(k => k.startsWith('GTM-'))
+
+[GA4 running]   severity HIGH
+  WHAT: is at least one GA4 measurement ID firing?
+  LOGIC: found_ga4 = regex G-[A-Z0-9]{6,} across captured request URLs
+         (appears as id=G-… on /gtag/js and tid=G-… on /g/collect).
+  PASS: found_ga4 non-empty. Detail lists count + IDs.
+  VERIFY (Network): filter "collect" → click a request → Payload/Query → read tid=.
+  NOTE: GA4 collect may not fire until consent is granted; the tool accepts
+        consent first, so absence here is meaningful.
+
+-- OBSERVATIONS (INFO, not scored) ---------------------------------------------
+
+[Tags detected]  — count + names of vendors matched.
+[<vendor> rows]  — one per matched vendor, showing the signal that matched.
+  VENDOR SIGNATURE TABLE (url substring  |  JS global):
+     Google Analytics 4      /g/collect, google-analytics.com/g/collect | gtag
+     Google Tag Manager      googletagmanager.com/gtm.js                | google_tag_manager
+     Google Ads/DoubleClick  googleadservices.com, googlesyndication.com, doubleclick.net, google.com/ads
+     Meta (Facebook) Pixel   connect.facebook.net, facebook.com/tr      | fbq
+     TikTok Pixel            analytics.tiktok.com                       | ttq
+     LinkedIn Insight        snap.licdn.com, px.ads.linkedin.com        | _linkedin_partner_id
+     X (Twitter) Pixel       static.ads-twitter.com, analytics.twitter.com, t.co/i/adsct | twq
+     Pinterest Tag           ct.pinterest.com, s.pinimg.com/ct          | pintrk
+     Snapchat Pixel          tr.snapchat.com, sc-static.net             | snaptr
+     Microsoft/Bing UET      bat.bing.com                               | uetq
+     Hotjar                  static.hotjar.com, script.hotjar.com       | hj
+     Microsoft Clarity       clarity.ms                                 | clarity
+     Segment                 cdn.segment.com
+     HubSpot                 js.hs-scripts.com, hs-analytics.net        | _hsq
+     Criteo                  criteo.com, criteo.net
+     Amplitude               amplitude.com, api.amplitude.com           | amplitude
+     Mixpanel                mixpanel.com, api.mixpanel.com             | mixpanel
+     Klaviyo                 klaviyo.com, static.klaviyo.com            | _learnq
+  VERIFY (Console): ['gtag','google_tag_manager','fbq','ttq','uetq','hj','clarity']
+                    .filter(g => typeof window[g] !== 'undefined')
+  VERIFY (Network): filter by any domain above to confirm the request fired.
+
+
+================================================================================
+ 2. ANALYTICS SETUP             (module: analytics.py)         [demo: Authorized]
+================================================================================
+HOW IT RUNS: loads page, accepts consent. Builds a "corpus" = all <script> src +
+inline text (first 3000 chars each) + performance resource URLs. Captures GA4
+collect requests via CDP (6s). IDs: G-[A-Z0-9]{6,}, GTM-[A-Z0-9]{4,}.
+"Google host" = host ending in google-analytics.com | google.com | doubleclick.net
+| googletagmanager.com. First-party = any other host.
+
+[GA4 presence]            HIGH
+  PASS if any G- id found in corpus OR any collect request seen.
+  VERIFY: Console → typeof gtag;  Network → filter "collect".
+
+[Single measurement ID]   HIGH
+  FAIL if more than one distinct G- id appears (duplicate-firing risk).
+  VERIFY: collect requests' tid= values, and grep page source for "G-".
+
+[Deployment method]       HIGH
+  GTM        if a gtm.js script OR window.google_tag_manager object exists.
+  gtag.js    if a /gtag/js script OR window.gtag exists (and no GTM).
+  Hardcoded  if inline "gtag(" text exists with no external loader.
+  FAIL only if none of the above is detected.
+  VERIFY: Network → "gtm.js" or "gtag/js";  Console → typeof google_tag_manager.
+
+[No conflicting implementations]  HIGH
+  FAIL if BOTH a third-party gtm.js AND a standalone gtag.js loader are present
+  (high risk of double-counting GA4 hits).
+  VERIFY: Network → confirm both gtm.js and gtag/js?id=G- are loading.
+
+[First-party tagging]     HIGH
+  PASS if any collect/gtm/gtag endpoint is on a FIRST-PARTY host.
+  FAIL "third-party only" if all such endpoints are on Google hosts.
+  FAIL "none observed" if no collect requests were seen at all.
+  VERIFY (Network): look at the HOST of /collect and gtm.js requests — your own
+                    domain (first-party) vs google-analytics.com/googletagmanager.com.
+
+[sGTM / GTG signals]      HIGH
+  PASS if GTM is served from a custom domain, OR collect hits a custom domain,
+  OR a /gtg endpoint is present (server-side GTM / Google tag gateway).
+  VERIFY (Network): is gtm.js / collect served from your own subdomain? any /gtg?
+
+
+================================================================================
+ 3. CONSENT & PRIVACY           (module: consent.py)          [demo: Authorized]
+================================================================================
+HOW IT RUNS: loads the page and runs checks 1–4 BEFORE accepting consent, then
+accepts and runs check 5. Uses CDP network capture.
+
+[CMP banner detected]     MEDIUM
+  PASS if window.__tcfapi is a function (TCF 2.0), OR a visible element matches a
+  known CMP selector (OneTrust #onetrust-banner-sdk, Cookiebot #CybotCookiebotDialog,
+  TrustArc, Quantcast .qc-cmp2-container, Didomi #didomi-popup, ClearCookie
+  .clearcookie__inner, or generic [id*='cookie-banner'] / [class*='cookie-consent'] /
+  [role='dialog'][aria-label*='consent']).
+  VERIFY (Console): typeof window.__tcfapi
+                    document.querySelector("#onetrust-banner-sdk, #CybotCookiebotDialog, .clearcookie__inner")
+
+[Consent Mode implemented]  CRITICAL
+  PASS if window.dataLayer contains a ['consent','default', {…}] push.
+  VERIFY (Console):
+     (window.dataLayer||[]).filter(e => Array.isArray(e) && e[0]==='consent' && e[1]==='default')
+
+[Default denied: analytics_storage / ad_storage / ad_user_data / ad_personalization]  HIGH (×4)
+  Reads the dict from the consent default push above.
+  PASS if that signal === 'denied'.  FAIL if granted or missing.
+  SKIP all four if no Consent Mode default was found.
+  VERIFY (Console): inspect the object returned by the snippet above — check each
+                    of the four keys equals 'denied'.
+
+[Pre-consent GA4 firing]   CRITICAL
+  Polls collect requests for 5s BEFORE any consent interaction.
+  PASS if NONE fired (compliant).  FAIL if any /collect fired pre-consent.
+  VERIFY: open the site fresh (clear cookies), do NOT click the banner, watch
+          Network filtered "collect" — should be empty until you accept.
+
+[Post-consent update]      HIGH
+  Accepts consent, then within 8s looks in dataLayer for a consent-update event
+  (consent_update, gtm_consent_update, clearcookie_save_preferences,
+  CookieInformationConsentGiven, cookieyes-consent-update) — also nested value.event.
+  PASS if found, OR if collect requests fire after accepting (grant sent via gtag).
+  FAIL if neither (note: may indicate the accept-button selector didn't match).
+  VERIFY (Console): accept the banner, then
+     (window.dataLayer||[]).filter(e => e && /consent/i.test(e.event||''))
+
+
+================================================================================
+ 4. NETWORK / COLLECT           (module: network.py)          [demo: Authorized]
+================================================================================
+HOW IT RUNS: loads page, accepts consent, captures GA4 collect requests (10s).
+A "collect request" = URL containing "/collect" with query param v=2. POST-body
+params are merged into the query params before inspection.
+
+[GA4 collect requests]    CRITICAL
+  PASS if ≥1 such request seen. If none → this FAILs and the next checks SKIP.
+  VERIFY (Network): filter "collect"; open one → URL should have ?v=2.
+
+[Client ID (cid)]         HIGH   PASS if any collect carries a cid= param.
+[Session ID (sid)]        HIGH   PASS if any collect carries a sid= param.
+[Consent state (gcs)]     HIGH   PASS if any collect carries a gcs= param.
+  VERIFY (Network): click a collect request → Payload/Query → look for cid, sid, gcs.
+
+  gcs DECODE (shown in the detail): format G + 4 digits =
+     [ad_storage][analytics_storage][ad_user_data][ad_personalization], 1=granted/0=denied.
+     e.g. G111 → ad_storage granted, analytics granted, ad_user_data granted.
+          G100 → only ad_storage granted.
+
+[Event inventory]   INFO   distinct "en" (event name) params across all collects.
+[Session timeline]  INFO   collects grouped by cid/sid, ordered by timestamp,
+                            shown as en → en → en.
+  VERIFY (Network): the en= param on each collect is the GA4 event name; ordering
+                    by time reconstructs the session.
+
+
+================================================================================
+ 5. SECURITY HEADERS            (module: security_headers.py)  [demo: Authorized]
+================================================================================
+HOW IT RUNS: resilient_fetch(url) → inspects the response headers (lower-cased).
+A "Fetch" INFO row shows the source (raw HTTP vs browser), status, header count.
+GUARD: if the site was reached but ZERO headers were captured, the whole audit
+SKIPS ("no response headers captured") rather than failing every header.
+
+[HTTPS / HTTPS upgrade]   HIGH (CRITICAL if not HTTPS)
+  PASS if the final URL is https://. "HTTPS upgrade" if http:// redirected to https.
+[HSTS]                    HIGH    PASS if 'strict-transport-security' header present.
+[Content-Security-Policy] HIGH    PASS if 'content-security-policy' header present.
+[Clickjacking protection] MEDIUM  PASS if 'x-frame-options' present OR CSP contains
+                                  a 'frame-ancestors' directive.
+[X-Content-Type-Options]  MEDIUM  PASS if header value contains 'nosniff'.
+[Referrer-Policy]         LOW     PASS if 'referrer-policy' header present.
+[Permissions-Policy]      LOW     PASS if 'permissions-policy' header present.
+[Server disclosure]       INFO    Reports server / x-powered-by if leaked (never fails).
+  NOTE: presence-only — it does NOT grade policy strength (e.g. a weak CSP passes).
+  VERIFY (DevTools Network): reload, click the FIRST document request (the HTML),
+     → Headers → Response Headers. Confirm each header name above is present/absent.
+  VERIFY (terminal):  curl -sI https://SITE | grep -i "strict-transport\|content-security\|x-frame\|x-content-type\|referrer-policy\|permissions-policy"
+     (note: a WAF may answer curl differently than the browser — the tool's
+      browser fallback reads what Chrome actually received.)
+
+
+================================================================================
+ 6. SEO & METADATA              (module: seo.py)              [PUBLIC]
+================================================================================
+HOW IT RUNS: resilient_fetch(url) for the HTML, parsed with lxml; plus separate
+fetches of /robots.txt and /sitemap.xml. A "Fetch" INFO row shows source/status/size.
+All element lookups are XPath against the served HTML (what crawlers see).
+
+[Title tag]          HIGH/MEDIUM  XPath //head/title. FAIL if missing; MEDIUM warn
+                                  if length <10 or >65 chars; PASS if 10–65.
+[Meta description]   HIGH/MEDIUM  //meta[@name='description']/@content. FAIL if
+                                  missing; warn if length <50 or >165; PASS if 50–165.
+[Indexable]          CRITICAL     //meta[@name='robots']. FAIL if value contains
+                                  'noindex'; else PASS.
+[Canonical link]     MEDIUM       PASS if //link[@rel='canonical']/@href exists.
+[Mobile viewport]    MEDIUM       PASS if //meta[@name='viewport'] exists.
+[H1 heading]         MEDIUM/LOW   count //h1. FAIL if 0; LOW warn if >1; PASS if 1.
+[Language attribute] LOW          PASS if //html/@lang present.
+[Open Graph]         MEDIUM/LOW   collects og:* meta. FAIL if none; LOW if missing any
+                                  of og:title/og:description/og:image; PASS if all 3.
+[robots.txt]         MEDIUM/LOW   GET /robots.txt. PASS if 200 & non-empty (notes
+                                  whether it declares a Sitemap:); FAIL if missing.
+[sitemap.xml]        MEDIUM       GET /sitemap.xml. PASS if 200 and body contains "<".
+
+[Structured data (JSON-LD)]  INFO  parses //script[@type='application/ld+json'],
+                                   lists @type values found.
+[hreflang]                   INFO  //link[@rel='alternate']/@hreflang, lists locales.
+
+  VERIFY (Console):
+     document.title
+     document.querySelector("meta[name='description']")?.content
+     document.querySelector("meta[name='robots']")?.content       // look for "noindex"
+     document.querySelector("link[rel='canonical']")?.href
+     document.querySelector("meta[name='viewport']")?.content
+     document.querySelectorAll("h1").length
+     document.documentElement.lang
+     ['title','description','image'].map(k => document.querySelector(`meta[property='og:${k}']`)?.content)
+     [...document.querySelectorAll("script[type='application/ld+json']")].map(s => JSON.parse(s.textContent)['@type'])
+  VERIFY (browser): open  https://SITE/robots.txt  and  https://SITE/sitemap.xml
+  NOTE: the tool reads the *served* HTML (pre-JS) like a crawler; Console reads the
+        *rendered* DOM. They can differ on JS-injected tags — if a check disagrees
+        with Console, also check "View Page Source" (raw HTML).
+
+
+================================================================================
+ 7. DATALAYER EVENT CHECKS       (modules: core.py, journeys.py)   [CLI journeys]
+================================================================================
+These are the click-driven ecommerce/journey checks (page_load, shop, cart,
+purchase, …). Not in the web UI; run via `python run.py <journey>`.
+
+HOW A CHECK WORKS (core.check_event):
+  1. Capture after_index = current window.dataLayer length BEFORE the action.
+  2. Perform the action (navigate / click a selector from config).
+  3. Poll window.dataLayer every 300ms (up to event_poll timeout) for an entry
+     where entry['event'] == the expected name, at or after after_index.
+  4. If found, validate REQUIRED FIELDS by dot-notation path
+     (e.g. "ecommerce.items.0.item_id"): a path FAILS if it can't be resolved or
+     the value is empty — where "empty" means None, "" or [] ONLY (literal 0 and
+     false are treated as valid values).
+  PASS if the event is found and all required fields resolve to non-empty values.
+  VERIFY (Console): perform the action yourself, then inspect
+     window.dataLayer        // find the pushed event object
+     and confirm the required nested fields exist and are non-empty.
+  KNOWN PITFALL: if an event fires via an onclick that then triggers a full-page
+     navigation, window.dataLayer is reset on the new page — so a same-page poll
+     can miss it. Check the event on the page where it actually lands.
+
+================================================================================
+ END
+================================================================================

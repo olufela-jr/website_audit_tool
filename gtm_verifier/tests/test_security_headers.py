@@ -11,7 +11,10 @@ def _by_name(results):
 
 
 def _resp(headers, final_url="https://example.com"):
-    return lambda url, *a, **k: HttpResult(final_url, 200, headers, "")
+    # Real responses always carry baseline headers (content-type, date) — include
+    # them so "missing security headers" doesn't look like a capture failure.
+    base = {"content-type": "text/html; charset=utf-8", "date": "Wed, 01 Jan 2025 00:00:00 GMT"}
+    return lambda url, *a, **k: HttpResult(final_url, 200, {**base, **headers}, "")
 
 
 def test_security_all_present(monkeypatch):
@@ -60,7 +63,22 @@ def test_http_upgraded_to_https_passes(monkeypatch):
     assert res["HTTPS upgrade"].passed
 
 
-def test_security_fetch_failure(monkeypatch):
+def test_no_headers_captured_is_skipped_not_all_failed(monkeypatch):
+    # Reached the site but captured zero headers => measurement gap, not an
+    # insecure site. Must skip (one result), not emit a sweep of false FAILs.
+    monkeypatch.setattr(sh, "fetch", lambda url, *a, **k: HttpResult("https://example.com", 200, {}, ""))
+    res = sh.run_security_headers_audit("https://example.com")
+    assert len(res) == 1
+    assert res[0].skipped is True
+    assert "no response" in res[0].detail.lower()
+
+
+def test_security_fetch_failure_is_skipped_not_failed(monkeypatch):
+    # When neither raw nor browser fetch can reach the site, it's a transport
+    # dead-end, not an insecure site — SKIPPED (score-neutral), never failed.
     monkeypatch.setattr(sh, "fetch", lambda url, *a, **k: HttpResult(url, 0, error="conn refused"))
     res = sh.run_security_headers_audit("https://example.com")
-    assert len(res) == 1 and not res[0].passed
+    assert len(res) == 1
+    assert res[0].skipped is True
+    assert not res[0].passed
+    assert "not assessed" in res[0].detail.lower()

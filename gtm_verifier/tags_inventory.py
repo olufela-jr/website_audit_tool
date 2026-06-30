@@ -7,10 +7,12 @@ is matched against a signature table of common analytics / advertising vendors
 so the report can list "here is everything firing on your site".
 
 The per-vendor list is INFO severity (an inventory, not pass/fail). On top of
-that, two SCORED checks assert that the tags this site is *supposed* to run —
-the GTM container and GA4 measurement ID from config — are actually firing.
-Those move the score, so the tagging journey reports a real pass/fail instead
-of an all-INFO 0/0.
+that, two SCORED checks assert that GTM and GA4 are actually *running* — i.e.
+at least one container / measurement ID is firing — and report how many. This
+is a public, outside-in audit: there's no "expected" ID to match against (you
+have no affiliation with the site), so the test is presence + count, not
+identity. Those two checks move the score, so the journey reports a real
+pass/fail instead of an all-INFO 0/0.
 """
 
 import json
@@ -21,7 +23,6 @@ from typing import Dict, List, Set
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 
-import config
 from core import CheckResult, Severity, accept_consent, failed_check, make_driver
 
 _RE_GTM_ID = re.compile(r'GTM-[A-Z0-9]{4,}')
@@ -96,62 +97,36 @@ def _live_gtm_containers(driver: webdriver.Chrome) -> Set[str]:
     return {k for k in keys if k.startswith("GTM-")}
 
 
-def _expected_tag_checks(
+def _tag_presence_checks(
     driver: webdriver.Chrome, seen_urls: Set[str]
 ) -> List[CheckResult]:
-    """Scored pass/fail checks: are the configured GTM + GA4 tags actually
-    firing? Falls back to 'any GTM/GA4 detected' when config has no expected ID."""
+    """Scored pass/fail checks for a public audit: is GTM running, and is GA4
+    running? Presence + count, not identity — there's no expected ID to match
+    on a site you have no access to. Each lists what was found."""
     url_blob = " ".join(seen_urls)
-    found_gtm = _live_gtm_containers(driver) | set(_RE_GTM_ID.findall(url_blob))
+    found_gtm = sorted(_live_gtm_containers(driver) | set(_RE_GTM_ID.findall(url_blob)))
     # GA4 IDs appear as id=G-XXXX (gtag/js loader) and tid=G-XXXX (g/collect hits).
-    found_ga4 = set(_RE_GA4_ID.findall(url_blob))
+    found_ga4 = sorted(set(_RE_GA4_ID.findall(url_blob)))
 
-    checks: List[CheckResult] = []
-
-    expected_gtm = config.GTM_ID
-    if expected_gtm:
-        passed = expected_gtm in found_gtm
-        checks.append(CheckResult(
-            name=f"GTM container {expected_gtm} firing",
+    return [
+        CheckResult(
+            name="GTM running",
             event=None,
-            passed=passed,
-            detail=(f"Container {expected_gtm} detected"
-                    if passed else
-                    f"Expected {expected_gtm} but found: "
-                    f"{', '.join(sorted(found_gtm)) or 'no GTM container'}"),
-            severity=Severity.HIGH,
-        ))
-    else:
-        checks.append(CheckResult(
-            name="GTM container firing", event=None, passed=bool(found_gtm),
-            detail=(f"Containers: {', '.join(sorted(found_gtm))}"
+            passed=bool(found_gtm),
+            detail=(f"{len(found_gtm)} container(s): {', '.join(found_gtm)}"
                     if found_gtm else "No GTM container detected"),
             severity=Severity.HIGH,
-        ))
-
-    expected_ga4 = config.GA4_ID
-    if expected_ga4:
-        passed = expected_ga4 in found_ga4
-        checks.append(CheckResult(
-            name=f"GA4 measurement ID {expected_ga4} firing",
+        ),
+        CheckResult(
+            name="GA4 running",
             event=None,
-            passed=passed,
-            detail=(f"Measurement ID {expected_ga4} detected in network traffic"
-                    if passed else
-                    f"Expected {expected_ga4} but found: "
-                    f"{', '.join(sorted(found_ga4)) or 'no GA4 hits'} "
-                    "(GA4 collect may require granted consent)"),
+            passed=bool(found_ga4),
+            detail=(f"{len(found_ga4)} measurement ID(s): {', '.join(found_ga4)}"
+                    if found_ga4 else
+                    "No GA4 measurement ID detected (collect may require granted consent)"),
             severity=Severity.HIGH,
-        ))
-    else:
-        checks.append(CheckResult(
-            name="GA4 measurement ID firing", event=None, passed=bool(found_ga4),
-            detail=(f"Measurement IDs: {', '.join(sorted(found_ga4))}"
-                    if found_ga4 else "No GA4 measurement ID detected"),
-            severity=Severity.HIGH,
-        ))
-
-    return checks
+        ),
+    ]
 
 
 def run_tag_inventory_audit(url: str) -> List[CheckResult]:
@@ -189,9 +164,9 @@ def run_tag_inventory_audit(url: str) -> List[CheckResult]:
                 detail=" | ".join(how), severity=Severity.INFO,
             ))
 
-        # Scored checks: the expected GTM + GA4 tags must actually be firing.
-        # These have HIGH severity so they count toward the journey score.
-        scored = _expected_tag_checks(driver, seen_urls)
+        # Scored checks: is GTM running, is GA4 running (presence + count).
+        # HIGH severity so they count toward the journey score.
+        scored = _tag_presence_checks(driver, seen_urls)
 
         # Summary first-ish line for the report header.
         summary = CheckResult(

@@ -61,8 +61,12 @@ def test_seo_multiple_h1_flagged(monkeypatch):
     assert "2" in res["H1 heading"].detail
 
 
-def test_seo_fetch_failure(monkeypatch):
+def test_seo_fetch_failure_is_skipped_not_failed(monkeypatch):
+    # When neither raw nor browser fetch can retrieve the page, it's a transport
+    # dead-end, not a site defect — SKIPPED (score-neutral), never failed.
     monkeypatch.setattr(seo, "fetch", lambda url, *a, **k: HttpResult(url, 0, error="timeout"))
     res = seo.run_seo_audit("https://example.com")
-    assert len(res) == 1 and not res[0].passed
-    assert "fetch" in res[0].name.lower()
+    assert len(res) == 1
+    assert res[0].skipped is True
+    assert not res[0].passed
+    assert "not assessed" in res[0].detail.lower()

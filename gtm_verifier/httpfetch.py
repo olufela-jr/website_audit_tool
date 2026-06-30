@@ -24,6 +24,7 @@ class HttpResult:
     headers: Dict[str, str] = field(default_factory=dict)  # keys lower-cased
     text: str = ""
     error: Optional[str] = None
+    source: str = "raw HTTP"  # how the response was obtained (provenance)
 
     @property
     def ok(self) -> bool:

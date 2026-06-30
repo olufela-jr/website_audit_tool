@@ -240,18 +240,47 @@ def run_network_audit(url: str) -> List[CheckResult]:
 
 # ── GCS decoder ──────────────────────────────────────────────────────────────
 
+def _parse_gcs_digits(gcs: str) -> Optional[str]:
+    """
+    Return the digit string of a GA4 `gcs` parameter, or None if it is missing
+    or not a recognised G-prefixed binary string.
+
+    Format: G + [version flag] + [ad_storage] + [analytics_storage]
+    (1 = granted, 0 = denied). Only these two signals are encoded in gcs;
+    ad_user_data / ad_personalization live in the separate `gcd` parameter.
+    """
+    if not gcs:
+        return None
+    digits = gcs.lstrip("G")
+    if len(digits) < 3 or not all(c in "01" for c in digits):
+        return None
+    return digits
+
+
+def gcs_analytics_storage_granted(gcs: str) -> Optional[bool]:
+    """
+    Return the analytics_storage consent state encoded in a GA4 `gcs` parameter,
+    or None if gcs is missing/unparseable. The third digit (index 2) is
+    analytics_storage: G100 -> denied, G111/G101 -> granted.
+    """
+    digits = _parse_gcs_digits(gcs)
+    return None if digits is None else digits[2] == "1"
+
+
 def _interpret_gcs(gcs: str) -> str:
     """
     Best-effort human-readable decode of the GA4 gcs consent state parameter.
-    Format: G[ad_storage][analytics_storage][ad_user_data][ad_personalization]
-    where 1 = granted, 0 = denied.
+    Format: G + [version flag] + [ad_storage] + [analytics_storage] where
+    1 = granted, 0 = denied. e.g. G100 = both denied, G111 = both granted,
+    G101 = analytics_storage granted only.
+
+    Note: ad_user_data / ad_personalization are NOT carried in gcs (they are
+    encoded in the separate `gcd` parameter), so they are not reported here.
     """
-    _labels = ["ad_storage", "analytics_storage", "ad_user_data", "ad_personalization"]
-    digits = gcs.lstrip("G")
-    if not digits or not all(c in "01" for c in digits):
+    digits = _parse_gcs_digits(gcs)
+    if digits is None:
         return gcs  # unrecognised format — return raw
-    parts = []
-    for i, label in enumerate(_labels):
-        if i < len(digits):
-            parts.append(f"{label}={'granted' if digits[i] == '1' else 'denied'}")
-    return ", ".join(parts) if parts else gcs
+    return (
+        f"ad_storage={'granted' if digits[1] == '1' else 'denied'}, "
+        f"analytics_storage={'granted' if digits[2] == '1' else 'denied'}"
+    )

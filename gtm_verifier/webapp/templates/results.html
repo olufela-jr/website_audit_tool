@@ -32,6 +32,12 @@
     .SKIP { background: #fef9c3; color: #854d0e; }
     .INFO { background: #dbeafe; color: #1e40af; }
     .sev { color: #888; font-size: .8rem; }
+    .obs-head {
+      padding: .55rem 1rem; background: #fafafa; border-top: 1px solid #eee;
+      font-size: .82rem; font-weight: 600; color: #555; text-transform: uppercase; letter-spacing: .03em;
+    }
+    .obs-head .obs-note { font-weight: 400; text-transform: none; letter-spacing: 0; color: #999; }
+    .muted { color: #999; font-style: italic; }
     details { margin-top: .4rem; }
     summary { cursor: pointer; color: #2563eb; font-size: .82rem; }
     pre { background: #0b1021; color: #d6e2ff; padding: .8rem; border-radius: 6px; overflow-x: auto; font-size: .8rem; }
@@ -54,6 +60,23 @@
 
   <a class="dl" href="{{ url_for('download_report', run_id=run_id) }}">Download PowerPoint</a>
 
+  {% macro row(r) %}
+    <tr>
+      <td><span class="badge {{ r.status }}">{{ r.status }}</span></td>
+      <td>
+        <strong>{{ r.name }}</strong>
+        <span class="sev">[{{ r.severity }}]</span>
+        <div>{{ r.detail }}</div>
+        {% if r.status == 'FAIL' and r.event %}
+        <details>
+          <summary>dataLayer entry</summary>
+          <pre>{{ r.event | tojson(indent=2) }}</pre>
+        </details>
+        {% endif %}
+      </td>
+    </tr>
+  {% endmacro %}
+
   {% for a in audits %}
   <section class="audit">
     <header>
@@ -62,24 +85,20 @@
     </header>
     <table>
       <tbody>
-      {% for r in a.rows %}
-        <tr>
-          <td><span class="badge {{ r.status }}">{{ r.status }}</span></td>
-          <td>
-            <strong>{{ r.name }}</strong>
-            <span class="sev">[{{ r.severity }}]</span>
-            <div>{{ r.detail }}</div>
-            {% if r.status == 'FAIL' and r.event %}
-            <details>
-              <summary>dataLayer entry</summary>
-              <pre>{{ r.event | tojson(indent=2) }}</pre>
-            </details>
-            {% endif %}
-          </td>
-        </tr>
-      {% endfor %}
+      {% for r in a.checks %}{{ row(r) }}{% endfor %}
+      {% if not a.checks %}
+        <tr><td colspan="2" class="muted">No scored checks — see observations below.</td></tr>
+      {% endif %}
       </tbody>
     </table>
+    {% if a.observations %}
+    <div class="obs-head">Observations <span class="obs-note">— context, not scored</span></div>
+    <table>
+      <tbody>
+      {% for r in a.observations %}{{ row(r) }}{% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
   </section>
   {% endfor %}
 </body>
