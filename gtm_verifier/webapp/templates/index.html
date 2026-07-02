@@ -42,6 +42,11 @@
     .access-toggle label { font-size: .9rem; }
     .check input:disabled + label { color: #aaa; }
     .empty-note { color: #aaa; font-size: .85rem; font-style: italic; margin: .2rem 0 0; }
+    .hint-inline { font-weight: 400; color: #999; font-size: .85rem; }
+    .config-upload { margin-top: .9rem; padding-top: .8rem; border-top: 1px dashed #ddd; }
+    .config-upload label.field { font-size: .9rem; margin-bottom: .3rem; }
+    .config-upload input[type=file] { font-size: .9rem; }
+    .config-upload .blurb { margin-top: .45rem; }
 
     /* Running overlay */
     #overlay {
@@ -67,10 +72,11 @@
 
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
-  <form id="audit-form" action="{{ url_for('run_audit') }}" method="post">
+  <form id="audit-form" action="{{ url_for('run_audit') }}" method="post" enctype="multipart/form-data">
     <label class="field" for="url">Website URL</label>
-    <input type="text" id="url" name="url" placeholder="https://example.com"
-           value="{{ url or '' }}" autofocus required>
+    <input type="text" id="url" name="url"
+           placeholder="https://example.com  (optional if a config with site.base_url is uploaded)"
+           value="{{ url or '' }}" autofocus>
 
     {% for group in groups %}
     <fieldset class="{{ 'authorized' if group.requires_access else 'public' }}" data-stream="{{ group.id }}">
@@ -91,6 +97,19 @@
         <label for="{{ key }}">{{ label }}</label>
       </div>
       {% endfor %}
+      {% if group.requires_access %}
+      <div class="check">
+        <input type="checkbox" id="journeys" name="journeys" disabled>
+        <label for="journeys">dataLayer journeys <span class="hint-inline">(from the site config below)</span></label>
+      </div>
+      <div class="config-upload">
+        <label class="field" for="config_file">Site config (YAML, optional)</label>
+        <input type="file" id="config_file" name="config_file" accept=".yaml,.yml">
+        <p class="blurb">Per-site config with CSS selectors, journeys, and expected GTM/GA4 IDs
+          — see <code>config.example.yaml</code>. Enables journey verification for any site
+          without code changes; also lets the analytics audit verify the expected tag IDs.</p>
+      </div>
+      {% endif %}
       {% if not group['items'] %}
       <p class="empty-note">No audits available in this stream yet.</p>
       {% endif %}

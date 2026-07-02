@@ -1,26 +1,26 @@
-# Palm-View Sparkling Water Co. — verified configuration.
+# Palm-View Sparkling Water Co. — verified client configuration.
 #
 # Every selector below was crawled from the live site and confirmed by loading
-# the page in Chrome (see notes per slot). Run with:
+# the page in Chrome. Run with:
 #     python run.py --config palm_view_config.yaml
 #
-# IMPORTANT — site event model (affects journey results, not selectors):
+# Site event model:
 # The site is server-rendered. GA4 events are emitted two ways:
-#   1. On page load, via an inline `payload.events[]` array that is pushed to the
-#      dataLayer (e.g. view_item_list on /shop, view_item on /product/N,
-#      view_cart on /cart, purchase on /order/N, plus init + page_view globally).
+#   1. On page load, via an inline `payload.events[]` array pushed to the
+#      dataLayer (view_item_list on /shop, view_item on /product/N, view_cart
+#      on /cart, purchase on /order/N, plus init + page_view globally).
 #   2. On click, via inline onclick handlers (add_to_cart, remove_from_cart,
-#      select_promotion, generate_lead, sign_up).
-# The onclick events fire immediately BEFORE a full-page navigation, which resets
-# window.dataLayer on the destination page. The current journeys poll the
-# post-navigation dataLayer, so they will miss add_to_cart / select_promotion /
-# generate_lead / sign_up even though the tags are correct. Fixing that needs a
-# journey change (capture via CDP network, or read the dataLayer before nav) —
-# the selectors here are correct regardless.
+#      select_promotion, generate_lead, sign_up) — these fire immediately
+#      before a full-page navigation. The tool's persistent dataLayer log
+#      survives same-origin navigations, so they are captured.
+#
+# Known site gaps (expected FAILs — genuine audit findings, not tool issues):
+#   - /contact emits NO form_start / form_submit_error / form_submit events.
+#   - Product tiles do NOT push select_item on click (shop journey).
+#   - init pushes user_properties.client_id but no customer_type (page_load journey).
 
 site:
   base_url: "https://palm-view-sparkling-water-co-948395720075.asia-south1.run.app"
-  order_confirmation_url: "https://palm-view-sparkling-water-co-948395720075.asia-south1.run.app/order/1"
 
 tags:
   gtm_id: "GTM-K4BLC735"     # confirmed live in page source + google_tag_manager
@@ -32,54 +32,127 @@ timeouts:
 
 selectors:
   consent:
-    # GTM-injected "ClearCookie" CMP banner (#clearcookie-banner). It overlays the
-    # page and intercepts clicks until dismissed, so accepting it is mandatory.
-    accept_button: ".clearcookie-button--accept-all"   # verified: clickable, dismisses banner
+    # GTM-injected "ClearCookie" CMP banner (#clearcookie-banner). It overlays
+    # the page and intercepts clicks until dismissed.
+    accept_button: ".clearcookie-button--accept-all"
+
+journeys:
+  page_load:
+    description: "init + page_view fire on the homepage with required fields"
+    steps:
+      - goto: /
+      - accept_consent: true
+      - expect: {event: init, require: [client_id, user_properties.customer_type]}
+      - expect: {event: page_view, require: [page_title, page_path]}
+
+  consent:
+    description: "Accepting the CMP banner pushes clearcookie_save_preferences"
+    steps:
+      - goto: /
+      - mark: true              # only match pushes triggered by the accept click
+      - accept_consent: true
+      # ClearCookie's own save event (this site has no generic consent_update)
+      - expect: {event: clearcookie_save_preferences, require: [clearcookie.consentString]}
 
   shop:
-    # Product tiles are anchors to /product/N (38 on the listing). Clicking one
-    # navigates to the PDP. view_item_list fires on listing load.
-    product_card: "a[href^='/product/']"               # verified: 38 matches
+    description: "Listing page: view_item_list on load, select_item on product click"
+    steps:
+      - goto: /shop
+      - accept_consent: true
+      - expect: {event: view_item_list, require: [ecommerce.items]}
+      - click: "a[href^='/product/']"        # product tiles are anchors to /product/N
+      - expect: {event: select_item, require: [ecommerce.items.0]}
 
   product_detail:
-    # Add-to-cart is a POST form (action="/product/N/add"). The submit button has
-    # an onclick that pushes add_to_cart, then the form navigates to /cart.
-    add_to_cart: "form[action$='/add'] button[type='submit']"   # verified: 1 match
+    description: "PDP: view_item on load, add_to_cart on button click"
+    steps:
+      - goto: /shop
+      - accept_consent: true
+      - click: "a[href^='/product/']"
+      - expect: {event: view_item, require: [ecommerce.value, ecommerce.items.0]}
+      # Add-to-cart is a POST form (action='/product/N/add'); the onclick pushes
+      # add_to_cart just before the form navigates to /cart.
+      - click: "form[action$='/add'] button[type='submit']"
+      - expect: {event: add_to_cart, require: [ecommerce.value, ecommerce.items.0.quantity]}
 
   cart:
-    # Remove is a POST form (action="/cart/items/N/remove") with an onclick that
-    # pushes remove_from_cart.
-    remove_button: "form[action$='/remove'] button[type='submit']"   # verified: 1 match
-    proceed_to_checkout: "a[href='/checkout']"                       # verified: 1 match
+    description: "view_cart, remove_from_cart, begin_checkout"
+    steps:
+      - goto: /shop
+      - accept_consent: true
+      - click: "a[href^='/product/']"                        # seed the cart
+      - click: "form[action$='/add'] button[type='submit']"
+      - goto: /cart
+      - expect: {event: view_cart, require: [ecommerce.value, ecommerce.items]}
+      - click: "form[action$='/remove'] button[type='submit']"
+      - expect: {event: remove_from_cart}
+      - goto: /shop                                           # re-seed after removal
+      - click: "a[href^='/product/']"
+      - click: "form[action$='/add'] button[type='submit']"
+      - goto: /cart
+      - click: "a[href='/checkout']"
+      - expect: {event: begin_checkout}
 
   checkout:
-    address_field: "input[name='deliveryAddress']"     # verified (was 'address' — wrong)
-    emirate_field: "select[name='emirate']"            # verified (unchanged from original)
+    description: "add_shipping_info fires on checkout submission (places a test order)"
+    steps:
+      - goto: /shop
+      - accept_consent: true
+      - click: "a[href^='/product/']"                        # seed the cart
+      - click: "form[action$='/add'] button[type='submit']"
+      - goto: /checkout
+      - type: {selector: "input[name='customerName']", text: "Test User"}
+      - type: {selector: "input[name='customerEmail']", text: "test@example.com"}
+      - select_index: {selector: "select[name='emirate']", index: 1}
+      - type: {selector: "input[name='deliveryAddress']", text: "123 Test Street"}
+      # The Pay button's onclick pushes add_shipping_info, then the POST
+      # navigates to the order confirmation page.
+      - click: "form[action='/checkout'] button[type='submit']"
+      - expect: {event: add_shipping_info, require: [ecommerce.shipping_tier]}
+
+  purchase:
+    description: "purchase event on the order confirmation page"
+    steps:
+      - goto: /order/1          # stubbed order confirmation with GTM loaded
+      - accept_consent: true
+      - expect:
+          event: purchase
+          require: [ecommerce.transaction_id, ecommerce.value, ecommerce.shipping, ecommerce.items]
+          patterns:
+            ecommerce.transaction_id: '^PV-\d+$'
 
   subscribe:
-    # Plan cards are anchors to /shop whose onclick pushes select_promotion +
-    # generate_lead + sign_up together (3 cards on /subscribe).
-    plan_card: "a[onclick*='select_promotion']"        # verified: 3 matches
-    # NOTE: There is no separate email-capture lead form on this site — the lead
-    # events fire from the plan card above. These two slots point at the footer
-    # newsletter form so the journey doesn't crash, but generate_lead is NOT
-    # emitted here; it comes from plan_card.
-    form_email: "form[action='/subscribe'] input[type='email']"
-    form_submit: "form[action='/subscribe'] button[type='submit']"
+    description: "Plan card click pushes select_promotion + generate_lead + sign_up"
+    steps:
+      - goto: /subscribe
+      - accept_consent: true
+      # One onclick pushes all three lead events, then navigates to /shop.
+      # There is no separate email-capture lead form on this site.
+      - click: "a[onclick*='select_promotion']"
+      - expect: {event: select_promotion}
+      - expect: {event: generate_lead}
+      - expect: {event: sign_up}
 
   contact:
-    # POST form to /contact. NOTE: this site emits NO form_start /
-    # form_submit_error / form_submit dataLayer events, so those journey checks
-    # will fail regardless of selectors — the events simply don't exist here.
-    first_field: "input[name='name']"                  # verified
-    name_field: "input[name='name']"                   # verified
-    email_field: "input[name='email']"                 # verified
-    message_field: "textarea[name='message']"          # verified
-    submit_button: "form[action='/contact'] button[type='submit']"   # verified (was '.contact' — wrong)
+    description: "Contact form events (site currently emits none — expected FAILs)"
+    steps:
+      - goto: /contact
+      - accept_consent: true
+      - click: "input[name='name']"                           # focus → form_start
+      - expect: {event: form_start}
+      - click: "form[action='/contact'] button[type='submit']"  # empty submit → error
+      - expect: {event: form_submit_error, require: [error_fields, error_count]}
+      - type: {selector: "input[name='name']", text: "Test User"}
+      - type: {selector: "input[name='email']", text: "test@example.com"}
+      - type: {selector: "textarea[name='message']", text: "Automated verification message."}
+      - click: "form[action='/contact'] button[type='submit']"
+      - expect: {event: form_submit}
 
   search:
-    # Search lives ONLY on /shop (GET form, action="/shop", input name="q").
-    # NOTE: journey_search loads BASE_URL (homepage), which has no search box, so
-    # that journey needs to navigate to /shop first to exercise this.
-    input: "input[name='q']"                           # verified on /shop
-    submit: "form[action='/shop'] button[type='submit']"   # verified on /shop
+    description: "Site search pushes search with term and result count"
+    steps:
+      - goto: /shop             # the search box lives only on /shop
+      - accept_consent: true
+      - type: {selector: "input[name='q']", text: "sparkling"}
+      - click: "form[action='/shop'] button[type='submit']"
+      - expect: {event: search, require: [search_term, search_result_count]}

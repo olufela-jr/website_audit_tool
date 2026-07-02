@@ -2,13 +2,22 @@
 GA4 / GTM AUDIT TOOL — COMPLETE AUDIT REFERENCE
 ================================================================================
 
-Site:    https://palm-view-sparkling-water-co-948395720075.asia-south1.run.app
-GTM ID:  GTM-K4BLC735
-GA4 ID:  G-JXWM0TX7FS
+The tool has TWO MODES:
+  Foreign site (no config):  python run.py --url https://anysite.com
+                             -> runs the 6 infrastructure audits only
+  Client site (YAML config): python run.py [--config client.yaml]
+                             -> also runs the journeys defined in the config
+                                and verifies expected GTM/GA4 IDs are live
+
+Default config.yaml targets the Palm View test ground:
+  Site:    https://palm-view-sparkling-water-co-948395720075.asia-south1.run.app
+  GTM ID:  GTM-K4BLC735
+  GA4 ID:  G-JXWM0TX7FS
 
 Run command:
-  python run.py                          # all audits
+  python run.py                          # all audits + configured journeys
   python run.py <name> [<name> ...]      # specific audits only
+  python run.py --list                   # what's available
 
 Severity levels in output:
   [CRITICAL]  Compliance violation or tracking completely broken
@@ -228,312 +237,109 @@ How each check works:
     Always PASS — diagnostic output.
 
 ================================================================================
-DATALAYER JOURNEY AUDITS (require CSS selectors in config.yaml)
+DATALAYER JOURNEY AUDITS (defined declaratively in the YAML config)
 ================================================================================
 
-All journey audits below use window.dataLayer polling only — no network
-capture. The tool polls dataLayer every 300ms until the expected event
-appears or the timeout (15s by default) expires.
+Journeys are NOT hardcoded — each config file defines its own under
+`journeys:` as a list of steps (goto / accept_consent / click / type /
+select_index / mark) with `expect` blocks naming the dataLayer event,
+required fields (dot-notation), and optional regex `patterns`. The engine
+lives in journeys.py (run_journey); the schema is documented in
+config.example.yaml. Onboarding a new client site = writing YAML, no code.
 
-The after_index pattern: before every user interaction, the tool snapshots
-len(window.dataLayer). The poll then only looks at entries AFTER that index,
-so stale events from earlier in the journey are never matched.
+The tool polls the dataLayer every 300ms until the expected event appears or
+the timeout (15s by default) expires.
 
---------------------------------------------------------------------------------
-4. page_load
-   Command:  python run.py page_load
-   URL:      BASE_URL
-   Selectors needed: consent.accept_button
---------------------------------------------------------------------------------
+PERSISTENT EVENT LOG: core.py injects a recorder into every document that
+mirrors each dataLayer push into sessionStorage, which survives same-origin
+navigations. So events pushed by onclick handlers immediately before a
+full-page navigation (add_to_cart, generate_lead on server-rendered sites)
+are still caught — the old "events lost on navigation" gap is fixed.
 
-Actions:
-  1. Navigate to BASE_URL
-  2. Accept consent
+The after_index pattern: before every interaction step, the engine snapshots
+the log length. Each `expect` only matches entries AFTER that index, so stale
+events from earlier in the journey are never matched. accept_consent
+deliberately does not move the snapshot (page-load events fire before the
+banner is dismissed); use a `mark` step to isolate consent-triggered events.
 
-Checks:
-  init
-    Fields: client_id, user_properties.customer_type
-    Verifies the custom init event fires on page load with a client
-    identifier and the customer type property populated.
+The journeys described below are the ones defined in palm_view_config.yaml
+(= default config.yaml) for the Palm View test ground.
 
-  page_view
-    Fields: page_title, page_path
-    Verifies the standard page_view event fires with non-empty title
-    and path (basic page tracking confirmation).
 
 --------------------------------------------------------------------------------
-5. consent
-   Command:  python run.py consent
-   URL:      BASE_URL
-   Selectors needed: consent.accept_button
+Palm View journeys (see palm_view_config.yaml for exact steps + selectors)
 --------------------------------------------------------------------------------
 
-Actions:
-  1. Navigate to BASE_URL
-  2. Snapshot dataLayer length (after_index)
-  3. Accept consent
+  page_load       /            init (client_id, user_properties.customer_type)
+                               + page_view (page_title, page_path)
+                               KNOWN GAP: site omits customer_type -> FAIL
 
-Checks:
-  consent_update
-    Fields: consent_choice
-    The after_index ensures only the new push triggered by accepting
-    consent is matched — not any pre-existing consent entries.
-    Verifies the consent_update event fires and carries a consent_choice
-    value indicating the user's selection.
+  consent         /            clearcookie_save_preferences with
+                               clearcookie.consentString after accepting the
+                               banner (this CMP has no generic consent_update)
 
---------------------------------------------------------------------------------
-6. shop
-   Command:  python run.py shop
-   URL:      BASE_URL/shop
-   Selectors needed: consent.accept_button, shop.product_card
---------------------------------------------------------------------------------
+  shop            /shop        view_item_list on load; select_item on product
+                               tile click
+                               KNOWN GAP: tiles don't push select_item -> FAIL
 
-Actions:
-  1. Navigate to /shop
-  2. Accept consent
-  3. Click first product card
+  product_detail  PDP          view_item on load; add_to_cart on button click
+                               (event fires just before nav to /cart — caught
+                               by the persistent log)
 
-Checks:
-  view_item_list
-    Fields: ecommerce.items
-    Fires on page load. Verifies the product listing event fires and the
-    items array is populated (not empty).
+  cart            /cart        view_cart, remove_from_cart, begin_checkout
+                               (journey seeds the cart itself via /shop)
 
-  select_item
-    Fields: ecommerce.items.0
-    Fires when a product card is clicked. Verifies at least one item
-    object exists in the items array (dot notation: items[0]).
+  checkout        /checkout    add_shipping_info (ecommerce.shipping_tier).
+                               Fires from the Pay button's onclick, so the
+                               journey fills the whole form and SUBMITS it —
+                               places a test order on the demo site.
 
---------------------------------------------------------------------------------
-7. product_detail
-   Command:  python run.py product_detail
-   URL:      BASE_URL/shop → clicks into PDP
-   Selectors needed: consent.accept_button, shop.product_card,
-                     product_detail.add_to_cart
---------------------------------------------------------------------------------
+  purchase        /order/1     purchase with transaction_id, value, shipping,
+                               items; transaction_id must match ^PV-\d+$
+                               (regex is a `patterns:` entry in the YAML)
 
-Actions:
-  1. Navigate to /shop
-  2. Accept consent
-  3. Click product card (navigates to PDP)
-  4. Click add-to-cart button
+  subscribe       /subscribe   plan-card click pushes select_promotion +
+                               generate_lead + sign_up together (all three
+                               fire pre-navigation; caught by persistent log)
 
-Checks:
-  view_item
-    Fields: ecommerce.value, ecommerce.items.0
-    Fires on PDP load. Verifies the item value and at least one item
-    in the items array are populated.
+  contact         /contact     form_start, form_submit_error, form_submit
+                               KNOWN GAP: site emits none of these -> FAILs
 
-  add_to_cart
-    Fields: ecommerce.value, ecommerce.items.0.quantity
-    Fires when add-to-cart is clicked. Verifies value is populated and
-    the first item has a quantity field.
-
---------------------------------------------------------------------------------
-8. cart
-   Command:  python run.py cart
-   URL:      BASE_URL/shop → PDP → add to cart → /cart
-   Selectors needed: consent.accept_button, shop.product_card,
-                     product_detail.add_to_cart, cart.remove_button,
-                     cart.proceed_to_checkout
---------------------------------------------------------------------------------
-
-Actions:
-  1. Navigate to /shop, accept consent
-  2. Click product card, click add-to-cart (seeds the cart)
-  3. Navigate to /cart
-  4. Click remove button
-  5. Navigate back to /shop, re-add item, navigate to /cart
-  6. Click proceed-to-checkout
-
-Checks:
-  view_cart
-    Fields: ecommerce.value, ecommerce.items
-    Fires on /cart page load. Verifies cart total value and items array
-    are both present and non-empty.
-
-  remove_from_cart
-    Fields: none required
-    Fires when remove button is clicked. Presence only — no field
-    requirements for this event.
-
-  begin_checkout
-    Fields: none required
-    Fires when proceed-to-checkout is clicked. Presence only.
-    Note: if the proceed button navigates to /checkout, the event must
-    fire before navigation completes (standard GTM behaviour).
-
---------------------------------------------------------------------------------
-9. checkout
-   Command:  python run.py checkout
-   URL:      BASE_URL/shop → add to cart → /checkout
-   Selectors needed: consent.accept_button, shop.product_card,
-                     product_detail.add_to_cart, checkout.address_field,
-                     checkout.emirate_field
---------------------------------------------------------------------------------
-
-Actions:
-  1. Navigate to /shop, accept consent
-  2. Click product card, click add-to-cart (seeds the cart)
-  3. Navigate to /checkout
-  4. Type "123 Test Street" into the address field
-  5. Select the first option (index 1) from the emirate dropdown
-
-Checks:
-  add_shipping_info
-    Fields: ecommerce.shipping_tier
-    Fires when a shipping tier is selected. Verifies the shipping_tier
-    parameter is populated (e.g. "Standard", "Express").
-
---------------------------------------------------------------------------------
-10. purchase
-    Command:  python run.py purchase
-    URL:      ORDER_CONFIRMATION_URL (currently /order/1)
-    Selectors needed: consent.accept_button
---------------------------------------------------------------------------------
-
-Actions:
-  1. Navigate directly to ORDER_CONFIRMATION_URL
-  2. Accept consent
-
-Checks:
-  purchase
-    Fields: ecommerce.transaction_id, ecommerce.value,
-            ecommerce.shipping, ecommerce.items
-    Verifies the purchase event fires on the confirmation page with all
-    critical ecommerce fields populated.
-
-  purchase.transaction_id format
-    Validates the transaction_id value matches the pattern ^PV-\d+$
-    (e.g. PV-1001, PV-42300).
-    This is a separate named check so it appears as its own line in
-    the report even if the purchase event itself passed.
-    PASS = matches the pattern.
-    FAIL = wrong format, empty, or purchase event was not found.
-
---------------------------------------------------------------------------------
-11. subscribe
-    Command:  python run.py subscribe
-    URL:      BASE_URL/subscribe
-    Selectors needed: consent.accept_button, subscribe.plan_card,
-                      subscribe.form_email, subscribe.form_submit
---------------------------------------------------------------------------------
-
-Actions:
-  1. Navigate to /subscribe, accept consent
-  2. Click a plan card
-  3. Type test@example.com into the email field
-  4. Click the subscribe form submit button
-
-Checks:
-  select_promotion
-    Fields: none required
-    Fires when a plan card is clicked. Presence only.
-
-  generate_lead
-    Fields: none required
-    Fires when the subscribe form is submitted. Presence only.
-
-  sign_up
-    Status: SKIP — "Requires post-verification step"
-    The sign_up event can only fire after the user clicks a link in a
-    confirmation email. This cannot be automated and is always skipped.
-
---------------------------------------------------------------------------------
-12. contact
-    Command:  python run.py contact
-    URL:      BASE_URL/contact
-    Selectors needed: consent.accept_button, contact.first_field,
-                      contact.submit_button, contact.name_field,
-                      contact.email_field, contact.message_field
---------------------------------------------------------------------------------
-
-Actions:
-  1. Navigate to /contact, accept consent
-  2. Click the first form field (focus trigger)
-  3. Click submit without filling anything in (error trigger)
-  4. Fill name="Test User", email="test@example.com",
-     message="This is an automated verification message."
-  5. Click submit again
-
-Checks:
-  form_start
-    Fields: none required
-    Fires when the first form field gains focus. Presence only.
-    Triggered by clicking (not typing) the first field.
-
-  form_submit_error
-    Fields: error_fields, error_count
-    Fires when an invalid/empty form is submitted. Verifies both the
-    list of fields that failed validation and the error count are
-    present in the event payload.
-
-  form_submit
-    Fields: none required
-    Fires when a valid form is successfully submitted. Presence only.
-
---------------------------------------------------------------------------------
-13. search
-    Command:  python run.py search
-    URL:      BASE_URL
-    Selectors needed: consent.accept_button, search.input, search.submit
---------------------------------------------------------------------------------
-
-Actions:
-  1. Navigate to BASE_URL, accept consent
-  2. Type "test product" into the search input
-  3. Click the search submit button
-
-Checks:
-  search
-    Fields: search_term, search_result_count
-    Fires when a search is performed. Verifies both the term that was
-    searched and the result count are present in the event payload.
+  search          /shop        search (search_term, search_result_count);
+                               the search box only exists on /shop
 
 ================================================================================
-SELECTOR CONFIGURATION (config.yaml)
+JOURNEY CONFIGURATION (replaces the old per-selector table)
 ================================================================================
 
-All selectors below must be updated before running the journey audits.
-Use browser DevTools (right-click element → Inspect → right-click in
-Elements panel → Copy → Copy selector) to find the correct values.
+Selectors now live INSIDE each journey's steps in the YAML config — the only
+standalone selector is selectors.consent.accept_button (used by the global
+accept_consent helper; common CMPs are auto-detected, so it's optional).
 
-Current status:
-  consent.accept_button       = ".clearcookie-button--accept-all"  (CONFIRMED)
-  shop.product_card           = ".product-card"                    (TODO)
-  product_detail.add_to_cart  = "button.add-to-cart"               (TODO)
-  cart.remove_button          = "button.remove-item"               (TODO)
-  cart.proceed_to_checkout    = "button.checkout"                  (TODO)
-  checkout.address_field      = "input[name='address']"            (TODO)
-  checkout.emirate_field      = "select[name='emirate']"           (TODO)
-  subscribe.plan_card         = ".plan-card"                       (TODO)
-  subscribe.form_email        = "input[name='email']"              (TODO)
-  subscribe.form_submit       = "button[type='submit'].subscribe"  (TODO)
-  contact.first_field         = "input[name='name']"               (TODO)
-  contact.name_field          = "input[name='name']"               (TODO)
-  contact.email_field         = "input[name='email']"              (TODO)
-  contact.message_field       = "textarea[name='message']"         (TODO)
-  contact.submit_button       = "button[type='submit'].contact"    (TODO)
-  search.input                = "input[type='search']"             (TODO)
-  search.submit               = "button[type='submit'].search"     (TODO)
+Step types:   goto, accept_consent, mark, click, type, select_index
+Assertions:   expect {event, require: [dot.paths], patterns: {path: regex},
+              severity, name, timeout}, and skip {name, reason}
+
+Full schema with comments: config.example.yaml (and the journeys.py docstring).
+Worked example: palm_view_config.yaml.
+
+To find a selector: open the site in Chrome, right-click the element in
+DevTools -> Copy -> Copy selector, paste into the journey step.
 
 ================================================================================
 RECOMMENDED RUN ORDER
 ================================================================================
 
-Step 1 — Infrastructure (no selectors needed):
-  python run.py analytics_audit consent_audit network_audit
+Foreign site (no access, no config):
+  python run.py --url https://prospect.com
 
-Step 2 — Core page tracking (only consent selector needed):
-  python run.py page_load consent
+Client site, first contact — infrastructure only:
+  python run.py --config client.yaml analytics_audit consent_audit network_audit
 
-Step 3 — Ecommerce funnel (requires shop/cart/checkout selectors):
-  python run.py shop product_detail cart checkout purchase
+Client site, full — after writing journeys in the config:
+  python run.py --config client.yaml
 
-Step 4 — Lead generation pages:
-  python run.py subscribe contact search
-
-Step 5 — Full run:
-  python run.py
+PowerPoint deck for the client:
+  python run.py --config client.yaml --export report.pptx
 
 ================================================================================

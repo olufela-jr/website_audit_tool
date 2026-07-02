@@ -1,20 +1,60 @@
-import re
-from typing import List
+"""
+Declarative journey engine + wrappers for the site-agnostic audits.
 
-from analytics import run_analytics_audit
-from consent import run_consent_audit
-from network import run_network_audit
-from seo import run_seo_audit
-from security_headers import run_security_headers_audit
-from tags_inventory import run_tag_inventory_audit
+Journeys are defined in the YAML config (see config.example.yaml), not in
+Python, so onboarding a new client site never requires code changes. A journey
+is a list of steps:
+
+    steps:
+      - goto: /shop                  # navigate; relative paths resolve against site.base_url
+      - accept_consent: true         # dismiss the CMP banner (best effort, all frames)
+      - mark: true                   # manually snapshot the dataLayer position
+      - click: ".product-card"      # click the first element matching a CSS selector
+      - type: {selector: "input[name='q']", text: "sparkling"}
+      - select_index: {selector: "select[name='emirate']", index: 1}
+      - expect:                      # assert an event fired since the last action
+          event: view_item_list
+          require: [ecommerce.items]              # dot-notation required fields
+          patterns: {ecommerce.transaction_id: '^PV-\\d+$'}  # regex per field (own check line)
+          severity: HIGH             # CRITICAL | HIGH | MEDIUM | LOW | INFO
+          name: "listing event"      # optional display name
+          timeout: 15                # optional poll override (seconds)
+      - skip: {name: sign_up, reason: "Requires post-verification step"}
+
+Index bookkeeping: goto / click / type / select_index snapshot the dataLayer
+log position *before* they act, and every following `expect` only matches
+events recorded after that point (several expects after one action share it).
+accept_consent deliberately does NOT move the marker — page-load events fire
+before the banner is dismissed and must stay matchable. Put `mark` before
+accept_consent to isolate consent-triggered events.
+
+The dataLayer log persists across same-origin navigations (see core.py), so
+events pushed by onclick handlers immediately before a full-page navigation
+are still caught.
+
+If an action step fails (bad selector, timeout), every remaining `expect` in
+the journey is reported as blocked and the journey stops.
+"""
+
+import re
+import time
+from typing import Any, List, Tuple
+
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
 import config
+from analytics import run_analytics_audit
+from consent import run_consent_audit
+from network import run_network_audit
+from seo import run_seo_audit
+from security_headers import run_security_headers_audit
+from tags_inventory import run_tag_inventory_audit
 from core import (
     CheckResult,
+    Severity,
     _click,
     _type,
     accept_consent,
@@ -25,405 +65,196 @@ from core import (
     skip_check,
 )
 
-
-# ── Internal helpers ──────────────────────────────────────────────────────────
-
-def _add_product_to_cart(driver) -> None:
-    """Navigate to /shop, click a product card, then click add-to-cart.
-    Raises TimeoutException / WebDriverException on selector failure."""
-    driver.get(f"{config.BASE_URL}/shop")
-    _click(driver, config.PRODUCT_CARD)
-    _click(driver, config.ADD_TO_CART_BUTTON)
+_ACTION_KINDS = ("goto", "accept_consent", "mark", "click", "type", "select_index")
+_STEP_KINDS = _ACTION_KINDS + ("expect", "skip")
 
 
-# ── Journeys
+# ── Spec parsing helpers ──────────────────────────────────────────────────────
 
-def journey_page_load() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
+def _parse_step(step: Any) -> Tuple[str, Any]:
+    """A step is a single-key mapping like {goto: /shop}. Returns (kind, arg)."""
+    if not isinstance(step, dict) or len(step) != 1:
+        raise ValueError(f"each step must be a single-key mapping, got: {step!r}")
+    kind, arg = next(iter(step.items()))
+    if kind not in _STEP_KINDS:
+        raise ValueError(f"unknown step '{kind}' (valid: {', '.join(_STEP_KINDS)})")
+    return kind, arg
+
+
+def _severity(spec: dict) -> Severity:
+    raw = str(spec.get("severity", "HIGH")).upper()
     try:
-        driver.get(config.BASE_URL)
-        accept_consent(driver)
-        idx = 0  # check from the very start — init/page_view fire on load
-
-        results.append(check_event(driver, "init", ["client_id", "user_properties.customer_type"], idx))
-        results.append(check_event(driver, "page_view", ["page_title", "page_path"], idx))
-    finally:
-        driver.quit()
-    return results
+        return Severity[raw]
+    except KeyError:
+        return Severity.HIGH
 
 
-def journey_consent() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
-    try:
-        driver.get(config.BASE_URL)
-        # Capture index *before* accepting so we only catch the new push
-        idx = get_datalayer_length(driver)
-        accept_consent(driver)
-        results.append(check_event(driver, "consent_update", ["consent_choice"], idx))
-    finally:
-        driver.quit()
-    return results
+def _absolute(target: str) -> str:
+    if str(target).startswith(("http://", "https://")):
+        return target
+    if not config.BASE_URL:
+        raise ValueError(f"relative journey URL '{target}' but no base URL configured")
+    return config.BASE_URL + "/" + str(target).lstrip("/")
 
 
-def journey_shop() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
-    try:
-        driver.get(f"{config.BASE_URL}/shop")
-        accept_consent(driver)
-        idx = 0
+def _step_desc(kind: str, arg: Any) -> str:
+    if isinstance(arg, dict):
+        return f"{kind} {arg.get('selector') or arg}"
+    return f"{kind} {arg}" if not isinstance(arg, bool) else kind
 
-        results.append(check_event(driver, "view_item_list", ["ecommerce.items"], idx))
 
-        idx = get_datalayer_length(driver)
+def _resolve_path(entry: Any, path: str) -> Any:
+    """Resolve a dot-notation path (e.g. 'ecommerce.items.0.item_id')."""
+    value = entry
+    for part in str(path).split("."):
+        if isinstance(value, (list, tuple)):
+            value = value[int(part)]
+        elif isinstance(value, dict):
+            value = value[part]
+        else:
+            raise KeyError(part)
+    return value
+
+
+# ── Step execution ────────────────────────────────────────────────────────────
+
+def _settle(driver) -> None:
+    """Let a click-triggered navigation commit before the next step. Without
+    this, a goto right after a form-submitting click can cancel the in-flight
+    request (e.g. an add-to-cart POST), leaving the site in the wrong state."""
+    time.sleep(0.3)  # give the navigation a beat to start
+    deadline = time.monotonic() + config.DEFAULT_TIMEOUT
+    while time.monotonic() < deadline:
         try:
-            _click(driver, config.PRODUCT_CARD)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "select_item",
-                f"Could not click product card "
-                f"(update config.PRODUCT_CARD, currently '{config.PRODUCT_CARD}'): {exc}",
-            ))
-            return results
-
-        results.append(check_event(driver, "select_item", ["ecommerce.items.0"], idx))
-    finally:
-        driver.quit()
-    return results
+            if driver.execute_script("return document.readyState") == "complete":
+                return
+        except WebDriverException:
+            pass  # document mid-swap
+        time.sleep(0.2)
 
 
-def journey_product_detail() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
-    try:
-        driver.get(f"{config.BASE_URL}/shop")
+def _run_action(driver, kind: str, arg: Any, idx: int) -> int:
+    """Perform one action step; returns the new dataLayer marker index."""
+    if kind == "goto":
+        new_idx = get_datalayer_length(driver)
+        driver.get(_absolute(arg))
+        return new_idx
+    if kind == "accept_consent":
         accept_consent(driver)
-        idx = get_datalayer_length(driver)
+        return idx  # deliberately does not move the marker
+    if kind == "mark":
+        return get_datalayer_length(driver)
 
-        try:
-            _click(driver, config.PRODUCT_CARD)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "view_item",
-                f"Could not click product card "
-                f"(update config.PRODUCT_CARD, currently '{config.PRODUCT_CARD}'): {exc}",
-            ))
-            return results
-
-        results.append(
-            check_event(driver, "view_item", ["ecommerce.value", "ecommerce.items.0"], idx)
+    new_idx = get_datalayer_length(driver)
+    if kind == "click":
+        _click(driver, str(arg))
+        _settle(driver)
+    elif kind == "type":
+        _type(driver, str(arg["selector"]), str(arg.get("text", "")))
+    elif kind == "select_index":
+        el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, str(arg["selector"])))
         )
+        Select(el).select_by_index(int(arg.get("index", 1)))
+    return new_idx
 
-        idx = get_datalayer_length(driver)
-        try:
-            _click(driver, config.ADD_TO_CART_BUTTON)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "add_to_cart",
-                f"Could not click add-to-cart "
-                f"(update config.ADD_TO_CART_BUTTON, currently '{config.ADD_TO_CART_BUTTON}'): {exc}",
-            ))
-            return results
 
-        results.append(check_event(
-            driver, "add_to_cart",
-            ["ecommerce.value", "ecommerce.items.0.quantity"],
-            idx,
-        ))
-    finally:
-        driver.quit()
+def _run_expect(driver, spec: dict, idx: int) -> List[CheckResult]:
+    event = spec.get("event")
+    if not event:
+        return [failed_check("expect", f"journey config error: 'expect' needs an 'event' name, got {spec!r}")]
+    severity = _severity(spec)
+    result = check_event(
+        driver,
+        event,
+        [str(f) for f in (spec.get("require") or [])],
+        idx,
+        check_name=spec.get("name"),
+        timeout=spec.get("timeout"),
+        severity=severity,
+    )
+    results = [result]
+    for path, pattern in (spec.get("patterns") or {}).items():
+        results.append(_pattern_check(result, event, str(path), str(pattern), severity))
     return results
 
 
-def journey_cart() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
+def _pattern_check(
+    event_result: CheckResult, event: str, path: str, pattern: str, severity: Severity
+) -> CheckResult:
+    name = f"{event}.{path} format"
+    if event_result.event is None:
+        return failed_check(name, f"Cannot validate — event '{event}' was not found", severity)
     try:
-        # Seed the cart before navigating to /cart
-        driver.get(f"{config.BASE_URL}/shop")
-        accept_consent(driver)
-        try:
-            _click(driver, config.PRODUCT_CARD)
-            _click(driver, config.ADD_TO_CART_BUTTON)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "view_cart",
-                f"Could not seed cart (check config.PRODUCT_CARD / config.ADD_TO_CART_BUTTON): {exc}",
-            ))
-            return results
-
-        driver.get(f"{config.BASE_URL}/cart")
-        idx = 0
-        results.append(
-            check_event(driver, "view_cart", ["ecommerce.value", "ecommerce.items"], idx)
+        value = _resolve_path(event_result.event, path)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return CheckResult(
+            name=name, event=event_result.event, passed=False,
+            detail=f"'{path}' not present on the event", severity=severity,
         )
-
-        # Remove item
-        idx = get_datalayer_length(driver)
-        try:
-            _click(driver, config.CART_REMOVE_BUTTON)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "remove_from_cart",
-                f"Could not click remove button "
-                f"(update config.CART_REMOVE_BUTTON, currently '{config.CART_REMOVE_BUTTON}'): {exc}",
-            ))
-            return results
-
-        results.append(check_event(driver, "remove_from_cart", [], idx))
-
-        # Re-add item, navigate to cart, then proceed to checkout
-        try:
-            driver.get(f"{config.BASE_URL}/shop")
-            _click(driver, config.PRODUCT_CARD)
-            _click(driver, config.ADD_TO_CART_BUTTON)
-            driver.get(f"{config.BASE_URL}/cart")
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "begin_checkout",
-                f"Could not re-add item after removal: {exc}",
-            ))
-            return results
-
-        idx = get_datalayer_length(driver)
-        try:
-            _click(driver, config.PROCEED_TO_CHECKOUT_BUTTON)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "begin_checkout",
-                f"Could not click proceed-to-checkout "
-                f"(update config.PROCEED_TO_CHECKOUT_BUTTON, currently '{config.PROCEED_TO_CHECKOUT_BUTTON}'): {exc}",
-            ))
-            return results
-
-        results.append(check_event(driver, "begin_checkout", [], idx))
-    finally:
-        driver.quit()
-    return results
+    ok = re.search(pattern, str(value)) is not None
+    return CheckResult(
+        name=name,
+        event=event_result.event,
+        passed=ok,
+        detail=f"'{path}' = {value!r} {'matches' if ok else 'does not match'} /{pattern}/",
+        severity=severity,
+    )
 
 
-def journey_checkout() -> List[CheckResult]:
-    # Requires cart state — seeds its own cart before navigating to /checkout
-    driver = make_driver()
-    results = []
+# ── Journey runner ────────────────────────────────────────────────────────────
+
+def run_journey(name: str, spec: dict) -> List[CheckResult]:
+    """Execute one declarative journey spec and return its check results."""
+    steps = (spec or {}).get("steps") or []
+    if not steps:
+        return [failed_check(name, "journey config error: no 'steps' defined")]
+
     try:
-        driver.get(f"{config.BASE_URL}/shop")
-        accept_consent(driver)
-        try:
-            _click(driver, config.PRODUCT_CARD)
-            _click(driver, config.ADD_TO_CART_BUTTON)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "add_shipping_info",
-                f"Could not seed cart before checkout journey: {exc}",
-            ))
-            return results
+        parsed = [_parse_step(s) for s in steps]
+    except ValueError as exc:
+        return [failed_check(name, f"journey config error: {exc}")]
 
-        driver.get(f"{config.BASE_URL}/checkout")
-        idx = get_datalayer_length(driver)
-
-        try:
-            _type(driver, config.CHECKOUT_ADDRESS_FIELD, "123 Test Street")
-            # Select the first non-placeholder emirate option to trigger shipping tier
-            emirate_el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, config.CHECKOUT_EMIRATE_FIELD))
-            )
-            Select(emirate_el).select_by_index(1)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "add_shipping_info",
-                f"Could not fill address/emirate fields "
-                f"(update config.CHECKOUT_ADDRESS_FIELD / config.CHECKOUT_EMIRATE_FIELD): {exc}",
-            ))
-            return results
-
-        results.append(check_event(driver, "add_shipping_info", ["ecommerce.shipping_tier"], idx))
-    finally:
-        driver.quit()
-    return results
-
-
-def journey_purchase() -> List[CheckResult]:
-    # TODO: ORDER_CONFIRMATION_URL in config.py must point to a real or stubbed order
-    # confirmation page that already has GTM/GA4 loaded and pushes a purchase event.
     driver = make_driver()
-    results = []
+    results: List[CheckResult] = []
+    idx = 0
     try:
-        driver.get(config.ORDER_CONFIRMATION_URL)
-        accept_consent(driver)
-        idx = 0
-
-        purchase_result = check_event(
-            driver,
-            "purchase",
-            [
-                "ecommerce.transaction_id",
-                "ecommerce.value",
-                "ecommerce.shipping",
-                "ecommerce.items",
-            ],
-            idx,
-        )
-        results.append(purchase_result)
-
-        # Separately validate transaction_id format — reported as its own check
-        if purchase_result.event is not None:
+        for pos, (kind, arg) in enumerate(parsed):
+            if kind == "expect":
+                results.extend(_run_expect(driver, arg or {}, idx))
+                continue
+            if kind == "skip":
+                arg = arg or {}
+                results.append(skip_check(
+                    str(arg.get("name", "unnamed")), str(arg.get("reason", "")), _severity(arg)
+                ))
+                continue
             try:
-                txn_id = purchase_result.event.get("ecommerce", {}).get("transaction_id", "")
-            except AttributeError:
-                txn_id = ""
-            pattern = r"^PV-\d+$"
-            if re.match(pattern, str(txn_id)):
-                results.append(CheckResult(
-                    name="purchase.transaction_id format",
-                    event=purchase_result.event,
-                    passed=True,
-                    detail=f"transaction_id '{txn_id}' matches {pattern}",
-                ))
-            else:
-                results.append(CheckResult(
-                    name="purchase.transaction_id format",
-                    event=purchase_result.event,
-                    passed=False,
-                    detail=f"transaction_id '{txn_id}' does not match {pattern}",
-                ))
-        else:
-            results.append(failed_check(
-                "purchase.transaction_id format",
-                "Cannot validate — purchase event was not found",
-            ))
+                idx = _run_action(driver, kind, arg, idx)
+            except (TimeoutException, WebDriverException, ValueError, KeyError) as exc:
+                detail = f"step {pos + 1} ({_step_desc(kind, arg)}) failed: {exc}"
+                blocked = [a or {} for k, a in parsed[pos + 1:] if k == "expect"]
+                if blocked:
+                    for e in blocked:
+                        results.append(failed_check(
+                            e.get("name") or str(e.get("event", "expect")),
+                            f"Blocked — {detail}",
+                            _severity(e),
+                        ))
+                else:
+                    results.append(failed_check(name, detail))
+                break
     finally:
         driver.quit()
     return results
 
 
-def journey_subscribe() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
-    try:
-        driver.get(f"{config.BASE_URL}/subscribe")
-        accept_consent(driver)
-
-        idx = get_datalayer_length(driver)
-        try:
-            _click(driver, config.PLAN_CARD_SELECTOR)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "select_promotion",
-                f"Could not click plan card "
-                f"(update config.PLAN_CARD_SELECTOR, currently '{config.PLAN_CARD_SELECTOR}'): {exc}",
-            ))
-        else:
-            results.append(check_event(driver, "select_promotion", [], idx))
-
-        idx = get_datalayer_length(driver)
-        try:
-            _type(driver, config.SUBSCRIBE_FORM_EMAIL, "test@example.com")
-            _click(driver, config.SUBSCRIBE_FORM_SUBMIT)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "generate_lead",
-                f"Could not submit subscribe form "
-                f"(update config.SUBSCRIBE_FORM_EMAIL / config.SUBSCRIBE_FORM_SUBMIT): {exc}",
-            ))
-        else:
-            results.append(check_event(driver, "generate_lead", [], idx))
-
-        results.append(skip_check("sign_up", "Requires post-verification step"))
-    finally:
-        driver.quit()
-    return results
-
-
-def journey_contact() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
-    try:
-        driver.get(f"{config.BASE_URL}/contact")
-        accept_consent(driver)
-
-        # form_start — triggered by focusing the first field
-        idx = get_datalayer_length(driver)
-        try:
-            el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
-                EC.visibility_of_element_located((By.CSS_SELECTOR, config.CONTACT_FIRST_FIELD))
-            )
-            el.click()
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "form_start",
-                f"Could not focus first contact form field "
-                f"(update config.CONTACT_FIRST_FIELD, currently '{config.CONTACT_FIRST_FIELD}'): {exc}",
-            ))
-        else:
-            results.append(check_event(driver, "form_start", [], idx))
-
-        # form_submit_error — triggered by submitting empty form
-        idx = get_datalayer_length(driver)
-        try:
-            _click(driver, config.CONTACT_SUBMIT_BUTTON)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "form_submit_error",
-                f"Could not click contact submit "
-                f"(update config.CONTACT_SUBMIT_BUTTON, currently '{config.CONTACT_SUBMIT_BUTTON}'): {exc}",
-            ))
-        else:
-            results.append(
-                check_event(driver, "form_submit_error", ["error_fields", "error_count"], idx)
-            )
-
-        # form_submit — fill valid data and submit
-        idx = get_datalayer_length(driver)
-        try:
-            _type(driver, config.CONTACT_NAME_FIELD, "Test User")
-            _type(driver, config.CONTACT_EMAIL_FIELD, "test@example.com")
-            _type(driver, config.CONTACT_MESSAGE_FIELD, "This is an automated verification message.")
-            _click(driver, config.CONTACT_SUBMIT_BUTTON)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "form_submit",
-                f"Could not fill and submit contact form "
-                f"(update config.CONTACT_NAME_FIELD / config.CONTACT_EMAIL_FIELD / "
-                f"config.CONTACT_MESSAGE_FIELD / config.CONTACT_SUBMIT_BUTTON): {exc}",
-            ))
-        else:
-            results.append(check_event(driver, "form_submit", [], idx))
-    finally:
-        driver.quit()
-    return results
-
-
-def journey_search() -> List[CheckResult]:
-    driver = make_driver()
-    results = []
-    try:
-        driver.get(config.BASE_URL)
-        accept_consent(driver)
-
-        idx = get_datalayer_length(driver)
-        try:
-            _type(driver, config.SEARCH_INPUT, "test product")
-            _click(driver, config.SEARCH_SUBMIT)
-        except (TimeoutException, WebDriverException) as exc:
-            results.append(failed_check(
-                "search",
-                f"Could not interact with search "
-                f"(update config.SEARCH_INPUT / config.SEARCH_SUBMIT): {exc}",
-            ))
-        else:
-            results.append(
-                check_event(driver, "search", ["search_term", "search_result_count"], idx)
-            )
-    finally:
-        driver.quit()
-    return results
-
+# ── Site-agnostic audits (no selectors / journeys needed) ─────────────────────
 
 def journey_analytics_audit() -> List[CheckResult]:
-    return run_analytics_audit(config.BASE_URL)
+    return run_analytics_audit(
+        config.BASE_URL, expected_gtm_id=config.GTM_ID, expected_ga4_id=config.GA4_ID
+    )
 
 
 def journey_consent_audit() -> List[CheckResult]:

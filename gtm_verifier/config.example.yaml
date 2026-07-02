@@ -1,11 +1,24 @@
-# Copy this file to config.yaml and fill in the values for the site you are
-# auditing.  config.yaml is git-ignored so client-specific URLs / IDs never get
-# committed.  config.py auto-loads config.yaml on import.
+# Client configuration template.
+#
+# Copy to config.yaml (auto-loaded) or <client>.yaml (run with --config).
+# config.yaml is git-ignored so client-specific URLs / IDs never get committed.
+#
+# EVERY KEY IS OPTIONAL. The six infrastructure audits (analytics_audit,
+# consent_audit, network_audit, tag_inventory, seo, security_headers) only need
+# a URL — for a completely foreign site you don't even need a config file:
+#
+#     python run.py --url https://prospect.com
+#
+# A config file is for client sites where we're under the hood: expected tag
+# IDs to verify, the CMP accept selector, and journeys that walk the site and
+# assert the dataLayer events their GTM setup is supposed to push.
 
 site:
   base_url: "https://example.com"
-  order_confirmation_url: "https://example.com/order/1"
 
+# Expected tag IDs. When set, analytics_audit verifies these exact containers
+# are what's live on the site (catches wrong/stale/duplicate containers).
+# Leave out (or leave the placeholders) for detection-only reporting.
 tags:
   gtm_id: "GTM-XXXXXXX"
   ga4_id: "G-XXXXXXXXXX"
@@ -14,39 +27,51 @@ timeouts:
   default: 10       # seconds — WebDriverWait for DOM elements
   event_poll: 15    # seconds — dataLayer event polling
 
-# CSS selectors for the interactive journeys.  The three infrastructure audits
-# (analytics_audit, consent_audit, network_audit) need none of these.
-# Right-click the element in Chrome DevTools → Copy → Copy selector.
 selectors:
   consent:
-    accept_button: ".cookie-accept-all"             # CMP "Accept all" button
+    # Site-specific CMP "accept all" button. Optional — common CMPs (OneTrust,
+    # Cookiebot, Didomi, Quantcast, …) and generic accept-button text are
+    # auto-detected; set this only when auto-detection misses.
+    accept_button: ".cookie-accept-all"
 
-  shop:
-    product_card: ".product-card"                   # clickable product card (listing page)
+# ── Journeys ──────────────────────────────────────────────────────────────────
+# Each journey drives a fresh browser through a list of steps and asserts the
+# expected dataLayer events fire. Steps:
+#
+#   - goto: /shop                # navigate; relative to site.base_url, or absolute URL
+#   - accept_consent: true       # dismiss the CMP banner (best effort)
+#   - click: ".product-card"     # click first element matching a CSS selector
+#   - type: {selector: "input[name='q']", text: "hello"}
+#   - select_index: {selector: "select[name='country']", index: 1}
+#   - mark: true                 # manually snapshot the dataLayer position
+#   - expect:                    # assert an event fired since the last action
+#       event: view_item_list
+#       require: [ecommerce.items, ecommerce.items.0.item_id]   # dot-notation fields
+#       patterns: {ecommerce.transaction_id: '^ORD-\d+$'}       # regex, own check line
+#       severity: HIGH           # CRITICAL | HIGH | MEDIUM | LOW | INFO (default HIGH)
+#   - skip: {name: sign_up, reason: "Needs email verification"}
+#
+# goto/click/type/select_index snapshot the dataLayer position before acting;
+# every following `expect` matches only events pushed after that point. The
+# event log survives same-origin navigations, so events pushed right before a
+# page change are still caught. accept_consent does NOT move the snapshot
+# (page-load events fire before the banner is dismissed) — put `mark` before
+# it when a journey checks consent events specifically.
+#
+# Find selectors: DevTools → right-click element → Copy → Copy selector.
+journeys:
+  page_load:
+    description: "page_view fires on the homepage"
+    steps:
+      - goto: /
+      - accept_consent: true
+      - expect: {event: page_view, require: [page_title, page_path]}
 
-  product_detail:
-    add_to_cart: "button.add-to-cart"               # add-to-cart button (PDP)
-
-  cart:
-    remove_button: "button.remove-item"             # remove-item button in cart
-    proceed_to_checkout: "button.checkout"          # proceed-to-checkout button in cart
-
-  checkout:
-    address_field: "input[name='address']"          # street address text input
-    emirate_field: "select[name='emirate']"         # emirate/state <select> element
-
-  subscribe:
-    plan_card: ".plan-card"                         # subscription plan card
-    form_email: "input[name='email']"               # subscribe form email input
-    form_submit: "button[type='submit'].subscribe"  # subscribe form submit button
-
-  contact:
-    first_field: "input[name='name']"               # first focusable field in contact form
-    name_field: "input[name='name']"                # contact name input
-    email_field: "input[name='email']"              # contact email input
-    message_field: "textarea[name='message']"       # contact message textarea
-    submit_button: "button[type='submit'].contact"  # contact form submit button
-
-  search:
-    input: "input[type='search']"                   # search text input
-    submit: "button[type='submit'].search"          # search submit button
+  # shop:
+  #   description: "Listing → product click"
+  #   steps:
+  #     - goto: /shop
+  #     - accept_consent: true
+  #     - expect: {event: view_item_list, require: [ecommerce.items]}
+  #     - click: ".product-card"
+  #     - expect: {event: select_item, require: [ecommerce.items.0]}

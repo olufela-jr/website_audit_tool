@@ -53,6 +53,98 @@ class CheckResult:
     severity: Severity = Severity.HIGH
 
 
+# ── Persistent dataLayer recorder ─────────────────────────────────────────────
+#
+# window.dataLayer is wiped on every full-page navigation, so events pushed by
+# onclick handlers just before the browser navigates (add_to_cart, generate_lead
+# on server-rendered sites) vanish before a post-navigation poll can see them.
+#
+# This script is injected into every new document *before any page script runs*.
+# It intercepts window.dataLayer assignment and .push(), and mirrors a JSON
+# snapshot of every entry into sessionStorage, which survives same-origin
+# navigations within the tab. Polling reads the mirror, so the event log is
+# continuous across the whole journey. (A cross-origin hop starts a fresh log —
+# indexes captured before the hop simply match nothing, they never mis-match.)
+#
+# GTM replaces dataLayer.push with its own processor after it loads; the
+# accessor-property trap below keeps recording through that swap.
+_DL_RECORDER_JS = r"""
+(() => {
+  if (window.__dlvInstalled) return;
+  try { Object.defineProperty(window, '__dlvInstalled', {value: true}); } catch (e) {}
+  const KEY = '__dlv_log';
+  const CAP = 5000;              // keep the log bounded (sessionStorage quota)
+  const seen = new WeakSet();    // dedupe when the array is replaced/trimmed (same entry refs)
+  const mem = [];                // entries recorded on THIS page; flushed to storage on pagehide
+
+  function stored() {
+    try { return JSON.parse(sessionStorage.getItem(KEY) || '[]'); }
+    catch (e) { return []; }
+  }
+  function flush() {
+    try {
+      const log = stored().concat(mem).slice(-CAP);
+      sessionStorage.setItem(KEY, JSON.stringify(log));
+      mem.length = 0;
+    } catch (e) {}
+  }
+  function toPlain(entry) {
+    try { return JSON.parse(JSON.stringify(entry)); }
+    catch (e) {
+      // Arguments objects / circular refs: best-effort per-key copy
+      const out = {};
+      try {
+        for (const k in entry) {
+          try { out[k] = JSON.parse(JSON.stringify(entry[k])); }
+          catch (_) { out[k] = String(entry[k]); }
+        }
+      } catch (_) { return null; }
+      return out;
+    }
+  }
+  function record(entry) {
+    if (entry !== null && typeof entry === 'object') {
+      if (seen.has(entry)) return;   // already recorded (array was replaced, not re-pushed)
+      try { seen.add(entry); } catch (e) {}
+    }
+    mem.push(toPlain(entry));
+  }
+  function hook(arr) {
+    if (!Array.isArray(arr) || arr.__dlvHooked) return arr;
+    try { Object.defineProperty(arr, '__dlvHooked', {value: true}); } catch (e) { return arr; }
+    arr.forEach(record);  // entries already present (array literal / replaced array)
+    // Chain-wrap push as a PLAIN property. GTM later captures this function as
+    // its "original push" and replaces arr.push with its own — a clean one-way
+    // chain (page → GTM → us → Array.prototype.push). An accessor trap here
+    // makes that chain self-referential and sends GTM's queue into a loop.
+    const orig = arr.push;
+    arr.push = function () {
+      for (let i = 0; i < arguments.length; i++) record(arguments[i]);
+      return orig.apply(this, arguments);
+    };
+    return arr;
+  }
+  let current = undefined;
+  try {
+    Object.defineProperty(window, 'dataLayer', {
+      configurable: true,
+      get() { return current; },
+      set(v) { current = hook(v); },
+    });
+  } catch (e) {}
+  addEventListener('pagehide', flush);   // persist just before navigating away
+  window.__dlvRead = () => stored().concat(mem);
+})();
+"""
+
+# Falls back to the live dataLayer on documents created before the recorder
+# was installed (e.g. the initial about:blank).
+_DL_READ_JS = (
+    "return (typeof window.__dlvRead === 'function')"
+    " ? window.__dlvRead() : (window.dataLayer || [])"
+)
+
+
 # ── Driver ────────────────────────────────────────────────────────────────────
 
 def make_driver(performance_logging: bool = False) -> webdriver.Chrome:
@@ -86,13 +178,25 @@ def make_driver(performance_logging: bool = False) -> webdriver.Chrome:
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
     )
+    # Install the persistent dataLayer recorder on every document
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument", {"source": _DL_RECORDER_JS}
+    )
     return driver
 
 
 # ── dataLayer helpers ─────────────────────────────────────────────────────────
+#
+# Both helpers read the persistent recorder log (see _DL_RECORDER_JS), not the
+# live window.dataLayer. The log grows monotonically across same-origin page
+# loads, so an index captured before a click stays valid even when that click
+# triggers a full navigation.
 
 def get_datalayer_length(driver: webdriver.Chrome) -> int:
-    return driver.execute_script("return (window.dataLayer || []).length")
+    try:
+        return len(driver.execute_script(_DL_READ_JS) or [])
+    except WebDriverException:
+        return 0
 
 
 def poll_for_event(
@@ -102,14 +206,17 @@ def poll_for_event(
     after_index: int,
 ) -> Optional[dict]:
     """
-    Poll window.dataLayer every 300 ms until an entry whose 'event' key equals
-    event_name appears at or after after_index.  Returns the entry dict or None
-    on timeout.  after_index must be captured *before* triggering the action so
-    stale earlier pushes are ignored.
+    Poll the recorded dataLayer log every 300 ms until an entry whose 'event'
+    key equals event_name appears at or after after_index.  Returns the entry
+    dict or None on timeout.  after_index must be captured *before* triggering
+    the action so stale earlier pushes are ignored.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        data_layer = driver.execute_script("return window.dataLayer || []")
+        try:
+            data_layer = driver.execute_script(_DL_READ_JS) or []
+        except WebDriverException:
+            data_layer = []
         for entry in data_layer[after_index:]:
             if isinstance(entry, dict) and entry.get("event") == event_name:
                 return entry

@@ -1,29 +1,45 @@
-# Website Audit Tool — GTM / GA4 dataLayer Verifier
+# Website Audit Tool — GTM / GA4 Verifier
 
-Verifies that a site's Google Tag Manager / GA4 analytics are deployed and firing
-correctly. It drives a headless Chrome session, watches `window.dataLayer` and the
-GA4 network traffic, validates required fields on each event, and produces either a
-colour-coded terminal report or a client-ready PowerPoint deck.
+Audits a site's Google Tag Manager / GA4 implementation. It drives a Chrome
+session, watches `window.dataLayer` and GA4 network traffic, validates required
+fields on each event, and produces either a colour-coded terminal report or a
+client-ready PowerPoint deck.
+
+Works in **two modes**:
+
+- **Foreign site** — point it at any public URL, no configuration at all. Runs
+  the six infrastructure audits (useful for prospect audits / first contact).
+- **Client site** — a per-client YAML config adds expected GTM/GA4 IDs to
+  verify and declarative **journeys** that walk the site and assert the
+  dataLayer events their tagging is supposed to push. Onboarding a new client
+  is pure YAML — no code changes.
 
 ## What it checks
 
-**Infrastructure audits** — work on any site, no configuration of selectors needed:
+**Infrastructure audits** — work on any site, nothing but a URL needed:
 
 | Audit | Module | What it checks |
 |-------|--------|----------------|
-| `analytics_audit` | `analytics.py` | GA4 / GTM are present and correctly deployed |
-| `consent_audit`   | `consent.py`   | CMP banner, Consent Mode signals, pre-/post-consent GA4 firing |
-| `network_audit`   | `network.py`   | GA4 `collect` requests via CDP — client ID, session ID, consent state, event inventory, session timeline |
+| `analytics_audit` | `analytics.py` | GA4/GTM presence and deployment method; verifies expected IDs when configured |
+| `consent_audit`   | `consent.py`   | CMP banner, Consent Mode v2 signals, pre-/post-consent GA4 firing |
+| `network_audit`   | `network.py`   | GA4 `collect` requests via CDP — client ID, session ID, consent state, event inventory |
+| `tag_inventory`   | `tags_inventory.py` | All marketing/analytics tags and pixels on the page |
+| `seo`             | `seo.py`       | SEO & metadata checks |
+| `security_headers`| `security_headers.py` | HTTP security header checks |
 
-**Journey audits** — simulate user flows and assert the expected ecommerce / form
-events fire. These require CSS selectors for the target site (see Configuration):
+**Journeys** — defined per site in the YAML config as steps
+(`goto` / `click` / `type` / `select_index` / `accept_consent` / `mark`) plus
+`expect` blocks naming the dataLayer event, required fields (dot-notation), and
+optional regex patterns. See `config.example.yaml` for the schema and
+`palm_view_config.yaml` for a complete worked example against the demo site.
 
-`page_load`, `consent`, `shop`, `product_detail`, `cart`, `checkout`,
-`purchase`, `subscribe`, `contact`, `search`
+Events pushed by onclick handlers immediately before a full-page navigation are
+captured: a recorder injected into every document mirrors dataLayer pushes into
+`sessionStorage`, which survives same-origin navigations.
 
 Each check has a severity (CRITICAL / HIGH / MEDIUM / LOW / INFO). Scores are
-equal-weighted (PASS = 1, FAIL = 0); SKIP and INFO checks are excluded from the
-denominator.
+equal-weighted; SKIP and INFO checks are excluded from the denominator. The
+process exits non-zero if any non-INFO check fails, so it can gate CI.
 
 ## Setup
 
@@ -37,60 +53,69 @@ source venv/bin/activate
 pip install -r gtm_verifier/requirements.txt
 ```
 
-## Configuration
-
-```bash
-cd gtm_verifier
-cp config.example.yaml config.yaml
-```
-
-Then edit `config.yaml` with the target site's URLs, GTM/GA4 IDs, and CSS
-selectors. `config.yaml` is git-ignored so client-specific values stay local; the
-three infrastructure audits run without any selectors filled in.
-
-To wire up a journey, open the site in Chrome, right-click the relevant element in
-DevTools → **Copy → Copy selector**, and paste it into `config.yaml`. The only
-selector confirmed against the demo site so far is the consent accept button.
-
 ## Usage
 
 Run from inside `gtm_verifier/` with the venv active.
 
 ```bash
-# Terminal output (default)
-python run.py                          # all audits
-python run.py analytics_audit          # one audit
-python run.py page_load consent shop   # several audits
+# Foreign site — no config file needed
+python run.py --url https://prospect.com
+python run.py --url https://prospect.com analytics_audit consent_audit
 
-# PowerPoint export
-python run.py --export report.pptx                 # all audits → deck
-python run.py analytics_audit --export audit.pptx  # specific audits → deck
+# Client site — config.yaml auto-loads; --config for others
+python run.py                              # all audits + configured journeys
+python run.py --config client.yaml
+python run.py --config client.yaml shop cart          # specific journeys
+python run.py --url https://staging.client.com --config client.yaml
 
-# Custom config file
-python run.py --config staging.yaml --export report.pptx
+python run.py --list                       # available audits + journeys
+python run.py --export report.pptx         # PowerPoint deck
+HEADLESS=1 python run.py ...               # no visible Chrome window
 ```
 
-Recommended order: start with the infrastructure audits (they work immediately),
-then fill in selectors and run the journeys.
+## Onboarding a new client site
 
 ```bash
-python run.py analytics_audit consent_audit network_audit   # step 1
-python run.py page_load consent                             # step 2 (after selectors)
+cp config.example.yaml client.yaml
 ```
 
-The process exits non-zero if any non-INFO check fails, so it can gate CI.
+1. Set `site.base_url` (and `tags.gtm_id` / `tags.ga4_id` if known — the
+   analytics audit then verifies those exact containers are live).
+2. Set `selectors.consent.accept_button` only if the built-in CMP
+   auto-detection (OneTrust, Cookiebot, Didomi, Quantcast, generic accept
+   text, consent iframes) misses their banner.
+3. Write `journeys:` for the flows that matter. Selectors: DevTools →
+   right-click element → **Copy → Copy selector**.
+4. `python run.py --config client.yaml`
+
+## Web front end
+
+```bash
+flask --app webapp.app run        # from gtm_verifier/; HEADLESS=1 optional
+```
+
+Open http://localhost:5000. Enter a URL for the public/authorized audits, or
+upload a client config YAML to also run its journeys and verify expected tag
+IDs — same no-code onboarding as the CLI. Results render as HTML with a
+PowerPoint download.
 
 ## Project layout
 
 ```
 gtm_verifier/
-  run.py              CLI entry point and journey dispatch
-  config.py           loads config.yaml into module constants
-  config.example.yaml configuration template (copy to config.yaml)
-  core.py             driver, dataLayer polling, field validation, scoring, report
-  analytics.py        analytics_audit
-  consent.py          consent_audit
-  network.py          network_audit (CDP traffic capture)
-  journeys.py         the interactive journey audits
-  export.py           PowerPoint export
+  run.py                CLI entry point and audit dispatch
+  config.py             tolerant YAML config loader (every key optional)
+  config.example.yaml   client config template with the journey schema
+  palm_view_config.yaml verified worked example (Palm View demo site)
+  core.py               driver, persistent dataLayer recorder, polling,
+                        field validation, consent auto-accept, scoring, report
+  journeys.py           declarative journey engine + audit wrappers
+  analytics.py          analytics_audit
+  consent.py            consent_audit
+  network.py            network_audit (CDP traffic capture)
+  tags_inventory.py     tag_inventory
+  seo.py                seo
+  security_headers.py   security_headers
+  export.py             PowerPoint export
+  webapp/               Flask front end (URL + optional config upload)
 ```

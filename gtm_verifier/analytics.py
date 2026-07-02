@@ -48,7 +48,14 @@ def _host(url_str: str) -> str:
         return ""
 
 
-def run_analytics_audit(url: str) -> List[CheckResult]:
+def run_analytics_audit(
+    url: str,
+    expected_gtm_id: str = None,
+    expected_ga4_id: str = None,
+) -> List[CheckResult]:
+    """Audit the live tag deployment on `url`. When expected IDs are provided
+    (client mode), the detected containers are verified against them; without
+    them (foreign-site mode) detection is reported but nothing is compared."""
     driver = make_driver(performance_logging=True)
     results = []
     try:
@@ -136,6 +143,34 @@ def run_analytics_audit(url: str) -> List[CheckResult]:
                 event=None,
                 passed=True,
                 detail=f"One ID: {ga4_ids[0]}" if ga4_ids else "No duplicates (none found)",
+            ))
+
+        # ── Check: expected IDs match what is live (client mode only) ─────
+        if expected_ga4_id:
+            hit = expected_ga4_id in ga4_ids
+            results.append(CheckResult(
+                name="Expected GA4 ID live",
+                event=None,
+                passed=hit,
+                detail=(
+                    f"{expected_ga4_id} detected on the site"
+                    if hit else
+                    f"Expected {expected_ga4_id} but detected: "
+                    f"{', '.join(ga4_ids) or 'none'}"
+                ),
+            ))
+        if expected_gtm_id:
+            hit = expected_gtm_id in gtm_ids
+            results.append(CheckResult(
+                name="Expected GTM container live",
+                event=None,
+                passed=hit,
+                detail=(
+                    f"{expected_gtm_id} detected on the site"
+                    if hit else
+                    f"Expected {expected_gtm_id} but detected: "
+                    f"{', '.join(gtm_ids) or 'none'}"
+                ),
             ))
 
         # ── Check: deployment method ──────────────────────────────────────

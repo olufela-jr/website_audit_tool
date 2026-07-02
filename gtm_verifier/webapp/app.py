@@ -29,6 +29,7 @@ import traceback
 import uuid
 from typing import Dict, List, Tuple
 
+import yaml
 from flask import Flask, abort, redirect, render_template, request, send_file, url_for
 
 # The core audit modules (analytics.py, core.py, …) live one directory up and
@@ -39,7 +40,9 @@ if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 
 import analytics  # noqa: E402
+import config  # noqa: E402
 import consent  # noqa: E402
+import journeys as journeys_mod  # noqa: E402
 import network  # noqa: E402
 import seo  # noqa: E402
 import security_headers  # noqa: E402
@@ -160,14 +163,44 @@ def index():
 
 @app.route("/audit", methods=["POST"])
 def run_audit():
+    # Optional site config upload (YAML, see config.example.yaml): supplies the
+    # CMP accept selector, expected GTM/GA4 IDs, and declarative journeys for
+    # the target site — so new client sites need no code changes here either.
+    site_config = None
+    upload = request.files.get("config_file")
+    if upload and upload.filename:
+        try:
+            site_config = yaml.safe_load(upload.read().decode("utf-8", errors="replace"))
+            if not isinstance(site_config, dict):
+                raise ValueError("top level must be a YAML mapping")
+        except Exception as exc:
+            return render_template(
+                "index.html", groups=AUDIT_GROUPS,
+                error=f"Could not parse the config file: {exc}",
+            )
+
     url = (request.form.get("url") or "").strip()
+    if not url and site_config:
+        url = ((site_config.get("site") or {}).get("base_url") or "").strip()
     if not url:
-        return render_template("index.html", groups=AUDIT_GROUPS, error="Please enter a URL.")
+        return render_template(
+            "index.html", groups=AUDIT_GROUPS,
+            error="Please enter a URL (or upload a config with site.base_url).",
+        )
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    # Apply the uploaded config so the consent selector / timeouts take effect
+    # for this run. Without an upload, whatever config.yaml auto-loaded stays —
+    # same behaviour as the CLI. (Global state: fine for a single local process.)
+    if site_config is not None:
+        config.load_dict(site_config, path=upload.filename)
+    config.set_base_url(url)
+    site_journeys = (site_config or {}).get("journeys") or {}
+
     selected = [name for name in AUDITS if request.form.get(name)]
-    if not selected:
+    run_journeys = bool(request.form.get("journeys"))
+    if not selected and not run_journeys:
         return render_template(
             "index.html", groups=AUDIT_GROUPS, error="Pick at least one audit to run.", url=url
         )
@@ -188,11 +221,41 @@ def run_audit():
             journey_results.append((name, checks))
             continue
         try:
-            checks = fn(url)
+            if name == "analytics" and site_config is not None:
+                # Verify the uploaded config's expected tag IDs against the site
+                checks = analytics.run_analytics_audit(
+                    url, expected_gtm_id=config.GTM_ID, expected_ga4_id=config.GA4_ID
+                )
+            else:
+                checks = fn(url)
         except Exception as exc:  # one bad audit shouldn't 500 the whole page
             tb = traceback.format_exc()
             checks = [failed_check(name, f"Audit crashed: {exc}\n{tb}")]
         journey_results.append((name, checks))
+
+    # dataLayer journeys from the uploaded config (Authorized stream)
+    if run_journeys:
+        if not authorized:
+            journey_results.append(("journeys", [skip_check(
+                "Journey verification",
+                "Not assessed — access required: confirm authorized access to run journeys.",
+                Severity.HIGH,
+            )]))
+        elif not site_journeys:
+            journey_results.append(("journeys", [skip_check(
+                "Journey verification",
+                "No config uploaded (or it has no 'journeys:' section) — "
+                "upload a site config YAML to run dataLayer journeys.",
+                Severity.HIGH,
+            )]))
+        else:
+            for jname, spec in site_journeys.items():
+                try:
+                    checks = journeys_mod.run_journey(jname, spec)
+                except Exception as exc:
+                    tb = traceback.format_exc()
+                    checks = [failed_check(jname, f"Journey crashed: {exc}\n{tb}")]
+                journey_results.append((jname, checks))
 
     _prune_cache()
     run_id = uuid.uuid4().hex

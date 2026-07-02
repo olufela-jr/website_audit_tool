@@ -8,129 +8,60 @@ source venv/bin/activate
 cd gtm_verifier
 
 
-RUNNING AUDITS
---------------
-Terminal output (default):
-  python run.py                          # all audits
-  python run.py analytics_audit          # one audit
-  python run.py page_load consent shop   # multiple audits
+TWO MODES
+---------
+1) FOREIGN SITE (prospect / cold audit) — no config file needed at all:
+     python run.py --url https://prospect.com
+   Runs the six site-agnostic audits: analytics_audit, consent_audit,
+   network_audit, tag_inventory, seo, security_headers.
 
-PowerPoint export (new):
-  python run.py --export report.pptx                     # all audits → PowerPoint
-  python run.py analytics_audit --export audit.pptx      # specific audits → PowerPoint
-  python run.py -e report.pptx consent_audit network_audit
+2) CLIENT SITE (we're under the hood) — YAML config with journeys:
+     python run.py                          # config.yaml (Palm View test ground)
+     python run.py --config client.yaml     # a specific client
+   Runs the six audits PLUS every journey defined in the config's
+   journeys: section, and verifies the expected GTM/GA4 IDs are live.
 
-With custom config:
-  python run.py --config myconfig.yaml --export report.pptx
-
-
-CURRENT STATUS
---------------
-Working now (no selectors required):
-  analytics_audit, consent_audit, network_audit
-
-Not yet runnable (CSS selectors in config.yaml still need filling in):
-  page_load, consent, shop, product_detail, cart, checkout,
-  purchase, subscribe, contact, search
-
-Only confirmed selector so far:
-  consent.accept_button = ".clearcookie-button--accept-all"
-
-To wire up a journey, open gtm_verifier/config.yaml, find the TODO
-selector for that journey, right-click the element on the real site in
-Chrome DevTools → Copy → Copy selector, and paste it in.
+Useful flags:
+  python run.py --list                     # show available audits + configured journeys
+  python run.py shop cart                  # run specific audits/journeys only
+  python run.py --export report.pptx       # PowerPoint instead of terminal
+  python run.py --url https://staging.client.com --config client.yaml
+                                           # client journeys against another env
+  HEADLESS=1 python run.py ...             # no visible Chrome window
 
 
-AUDITS & WHERE THEY LIVE IN THE CODE
---------------------------------------
+ONBOARDING A NEW CLIENT (no code changes, ever)
+-----------------------------------------------
+1. cp config.example.yaml client.yaml
+2. Set site.base_url and (if known) tags.gtm_id / tags.ga4_id.
+3. Set selectors.consent.accept_button only if the common-CMP auto-detection
+   misses their banner.
+4. Write journeys: for the flows that matter. Each journey is steps
+   (goto / click / type / select_index / accept_consent / mark) plus
+   expect blocks naming the dataLayer event, required fields
+   (dot-notation), and optional regex patterns.
+   Selector how-to: DevTools -> right-click element -> Copy -> Copy selector.
+5. python run.py --config client.yaml
 
-  analytics_audit     analytics.py  →  run_analytics_audit()   ✓ WORKING
-  ---------------------------------------------------------------
-  Checks GA4/GTM is present and correctly deployed.
-  No selectors needed.
-
-  consent_audit       consent.py    →  run_consent_audit()
-  ---------------------------------------------------------------
-  Checks CMP banner, Consent Mode signals, pre-consent GA4 firing,
-  and post-consent update.
-  No selectors needed.
-
-  network_audit       network.py    →  run_network_audit()
-  ---------------------------------------------------------------
-  Captures GA4 collect requests via Chrome DevTools Protocol.
-  Reports client ID, session ID, consent state, event inventory,
-  and session timeline.
-  No selectors needed.
-
-  page_load           journeys.py   →  journey_page_load()
-  ---------------------------------------------------------------
-  Checks init and page_view fire on the homepage.
-  Selector needed: consent.accept_button
-
-  consent             journeys.py   →  journey_consent()
-  ---------------------------------------------------------------
-  Checks consent_update fires after accepting the banner.
-  Selector needed: consent.accept_button
-
-  shop                journeys.py   →  journey_shop()
-  ---------------------------------------------------------------
-  Checks view_item_list and select_item on the /shop page.
-  Selectors needed: consent.accept_button, shop.product_card
-
-  product_detail      journeys.py   →  journey_product_detail()
-  ---------------------------------------------------------------
-  Checks view_item and add_to_cart on the product detail page.
-  Selectors needed: consent.accept_button, shop.product_card,
-                    product_detail.add_to_cart
-
-  cart                journeys.py   →  journey_cart()
-  ---------------------------------------------------------------
-  Checks view_cart, remove_from_cart, begin_checkout.
-  Selectors needed: consent.accept_button, shop.product_card,
-                    product_detail.add_to_cart, cart.remove_button,
-                    cart.proceed_to_checkout
-
-  checkout            journeys.py   →  journey_checkout()
-  ---------------------------------------------------------------
-  Checks add_shipping_info after filling address and emirate.
-  Selectors needed: consent.accept_button, shop.product_card,
-                    product_detail.add_to_cart,
-                    checkout.address_field, checkout.emirate_field
-
-  purchase            journeys.py   →  journey_purchase()
-  ---------------------------------------------------------------
-  Checks purchase event and transaction_id format on the order
-  confirmation page (ORDER_CONFIRMATION_URL in config.yaml).
-  Selector needed: consent.accept_button
-
-  subscribe           journeys.py   →  journey_subscribe()
-  ---------------------------------------------------------------
-  Checks select_promotion and generate_lead on /subscribe.
-  Selectors needed: consent.accept_button, subscribe.plan_card,
-                    subscribe.form_email, subscribe.form_submit
-
-  contact             journeys.py   →  journey_contact()
-  ---------------------------------------------------------------
-  Checks form_start, form_submit_error, form_submit on /contact.
-  Selectors needed: consent.accept_button, contact.first_field,
-                    contact.name_field, contact.email_field,
-                    contact.message_field, contact.submit_button
-
-  search              journeys.py   →  journey_search()
-  ---------------------------------------------------------------
-  Checks search event fires with search_term and result count.
-  Selectors needed: consent.accept_button, search.input,
-                    search.submit
+The full step/expect schema is documented in config.example.yaml and at the
+top of journeys.py. palm_view_config.yaml is a complete worked example.
 
 
-RECOMMENDED ORDER
------------------
-Step 1 — infrastructure (works immediately, no selectors):
-  python run.py analytics_audit consent_audit network_audit
+WEB FRONT END
+-------------
+flask --app webapp.app run          (from gtm_verifier/, HEADLESS=1 optional)
+Open http://localhost:5000. Enter a URL for the public/authorized audits;
+upload a client config YAML to also run its journeys and verify tag IDs.
 
-Step 2 — fill in selectors in gtm_verifier/config.yaml, then:
-  python run.py page_load consent
-  python run.py shop product_detail cart checkout purchase
-  python run.py subscribe contact search
+
+NOTES
+-----
+- Events pushed by onclick handlers right before a page navigation ARE
+  captured (persistent dataLayer log in core.py survives same-origin
+  navigations). Cross-origin hops start a fresh log.
+- Exit code is non-zero if any non-INFO check fails, so runs can gate CI.
+- Known Palm View site gaps (expected FAILs, listed in palm_view_config.yaml):
+  no select_item on product tiles, no customer_type on init, no contact
+  form events.
 
 ================================================================================
