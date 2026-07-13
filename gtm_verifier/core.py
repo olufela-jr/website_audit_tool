@@ -1,16 +1,11 @@
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple
 
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Frame, Page
 
 import config
 
@@ -140,50 +135,9 @@ _DL_RECORDER_JS = r"""
 # Falls back to the live dataLayer on documents created before the recorder
 # was installed (e.g. the initial about:blank).
 _DL_READ_JS = (
-    "return (typeof window.__dlvRead === 'function')"
+    "(typeof window.__dlvRead === 'function')"
     " ? window.__dlvRead() : (window.dataLayer || [])"
 )
-
-
-# ── Driver ────────────────────────────────────────────────────────────────────
-
-def make_driver(performance_logging: bool = False) -> webdriver.Chrome:
-    opts = Options()
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    # Run without a visible window only when explicitly requested (e.g. on a
-    # server). Defaults to a visible browser so runs can be watched locally.
-    if os.environ.get("HEADLESS") == "1":
-        opts.add_argument("--headless=new")
-        opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument(
-        "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-
-    # Performance logging must be set last to avoid capability conflicts
-    if performance_logging:
-        opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-    driver = webdriver.Chrome(options=opts)
-    # Don't let a slow/hostile site hang an audit indefinitely — fail fast.
-    # Raises TimeoutException (a WebDriverException) from driver.get(), which the
-    # audits already handle.
-    driver.set_page_load_timeout(45)
-    # Mask navigator.webdriver so GTM consent/detection code behaves normally
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
-    )
-    # Install the persistent dataLayer recorder on every document
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument", {"source": _DL_RECORDER_JS}
-    )
-    return driver
-
 
 # ── dataLayer helpers ─────────────────────────────────────────────────────────
 #
@@ -192,15 +146,15 @@ def make_driver(performance_logging: bool = False) -> webdriver.Chrome:
 # loads, so an index captured before a click stays valid even when that click
 # triggers a full navigation.
 
-def get_datalayer_length(driver: webdriver.Chrome) -> int:
+def get_datalayer_length(page: Page) -> int:
     try:
-        return len(driver.execute_script(_DL_READ_JS) or [])
-    except WebDriverException:
+        return len(page.evaluate(_DL_READ_JS) or [])
+    except PlaywrightError:
         return 0
 
 
 def poll_for_event(
-    driver: webdriver.Chrome,
+    page: Page,
     event_name: str,
     timeout: float,
     after_index: int,
@@ -214,13 +168,17 @@ def poll_for_event(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            data_layer = driver.execute_script(_DL_READ_JS) or []
-        except WebDriverException:
+            data_layer = page.evaluate(_DL_READ_JS) or []
+        except PlaywrightError:
             data_layer = []
         for entry in data_layer[after_index:]:
             if isinstance(entry, dict) and entry.get("event") == event_name:
                 return entry
-        time.sleep(0.3)
+        # wait_for_timeout (not time.sleep) keeps network/event dispatch alive
+        try:
+            page.wait_for_timeout(300)
+        except PlaywrightError:
+            time.sleep(0.3)
     return None
 
 
@@ -260,7 +218,7 @@ def validate_fields(event_entry: dict, required_fields: List[str]) -> List[str]:
 # ── Combined check ────────────────────────────────────────────────────────────
 
 def check_event(
-    driver: webdriver.Chrome,
+    page: Page,
     event_name: str,
     required_fields: List[str],
     after_index: int,
@@ -271,7 +229,7 @@ def check_event(
     """Poll for event_name then validate required_fields. Returns a CheckResult."""
     name = check_name or event_name
     poll_timeout = timeout if timeout is not None else config.EVENT_POLL_TIMEOUT
-    entry = poll_for_event(driver, event_name, poll_timeout, after_index)
+    entry = poll_for_event(page, event_name, poll_timeout, after_index)
 
     if entry is None:
         return CheckResult(
@@ -338,7 +296,7 @@ _CONSENT_TEXTS = [
 # One in-page sweep: try each selector, then match visible control text.
 # Returns the selector/label that was clicked, or null if nothing matched.
 _ACCEPT_JS = r"""
-const selectors = arguments[0], texts = arguments[1];
+([selectors, texts]) => {
 function clickable(el){
   if(!el || el.disabled) return false;
   const s = getComputedStyle(el);
@@ -354,10 +312,11 @@ for (const el of els){
   if(texts.some(t => label === t || label.startsWith(t))){ el.click(); return label; }
 }
 return null;
+}
 """
 
 
-def accept_consent(driver: webdriver.Chrome) -> None:
+def accept_consent(page: Page) -> None:
     """Best-effort dismissal of a cookie/consent banner by clicking an
     'accept all' control. Tries the site-specific selector from config first,
     then common CMP selectors, then visible button text — in the top document
@@ -366,37 +325,29 @@ def accept_consent(driver: webdriver.Chrome) -> None:
     selectors = [s for s in [config.CONSENT_ACCEPT_BUTTON, *_CONSENT_SELECTORS] if s]
     deadline = time.monotonic() + (config.DEFAULT_TIMEOUT or 10)
     while time.monotonic() < deadline:
-        if _sweep_all_frames(driver, selectors):
+        if _sweep_all_frames(page, selectors):
             return
-        time.sleep(0.3)
-
-
-def _sweep(driver: webdriver.Chrome, selectors: List[str]) -> bool:
-    """Run one accept-control sweep in the current browsing context."""
-    try:
-        return bool(driver.execute_script(_ACCEPT_JS, selectors, _CONSENT_TEXTS))
-    except WebDriverException:
-        return False
-
-
-def _sweep_all_frames(driver: webdriver.Chrome, selectors: List[str]) -> bool:
-    """Sweep the top document, then any iframes (CMP-looking ones first).
-    Selenium can enter cross-origin frames that page JS cannot reach."""
-    if _sweep(driver, selectors):
-        return True
-    for frame in _candidate_frames(driver):
-        hit = False
         try:
-            driver.switch_to.frame(frame)
-            hit = _sweep(driver, selectors)
-        except WebDriverException:
-            hit = False
-        finally:
-            try:
-                driver.switch_to.default_content()
-            except WebDriverException:
-                pass
-        if hit:
+            page.wait_for_timeout(300)
+        except PlaywrightError:
+            return  # page gone — nothing left to dismiss
+
+
+def _sweep(frame: Frame, selectors: List[str]) -> bool:
+    """Run one accept-control sweep inside the given frame."""
+    try:
+        return bool(frame.evaluate(_ACCEPT_JS, [selectors, _CONSENT_TEXTS]))
+    except PlaywrightError:
+        return False  # frame detached / navigated mid-sweep
+
+
+def _sweep_all_frames(page: Page, selectors: List[str]) -> bool:
+    """Sweep the top document, then any iframes (CMP-looking ones first).
+    Playwright evaluates in cross-origin frames that page JS cannot reach."""
+    if _sweep(page.main_frame, selectors):
+        return True
+    for frame in _candidate_frames(page):
+        if _sweep(frame, selectors):
             return True
     return False
 
@@ -407,20 +358,17 @@ _CMP_FRAME_HINTS = (
 )
 
 
-def _candidate_frames(driver: webdriver.Chrome) -> List:
-    """Return up to 12 iframes, CMP-looking ones first, to limit frame switching."""
+def _candidate_frames(page: Page) -> List[Frame]:
+    """Return up to 12 child frames, CMP-looking ones first, to bound the sweep."""
     try:
-        frames = driver.find_elements(By.TAG_NAME, "iframe")
-    except WebDriverException:
+        frames = [f for f in page.frames if f is not page.main_frame]
+    except PlaywrightError:
         return []
     scored = []
     for fr in frames:
         try:
-            attrs = " ".join(
-                a for a in (fr.get_attribute("id"), fr.get_attribute("title"),
-                            fr.get_attribute("src")) if a
-            ).lower()
-        except WebDriverException:
+            attrs = f"{fr.url} {fr.name}".lower()
+        except PlaywrightError:
             attrs = ""
         cmpish = any(hint in attrs for hint in _CMP_FRAME_HINTS)
         scored.append((0 if cmpish else 1, fr))
@@ -428,19 +376,15 @@ def _candidate_frames(driver: webdriver.Chrome) -> List:
     return [fr for _, fr in scored[:12]]
 
 
-def _click(driver: webdriver.Chrome, selector: str) -> None:
-    el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-    )
-    el.click()
+def _click(page: Page, selector: str) -> None:
+    # .first preserves "click the first match" semantics — a bare locator is
+    # strict and throws when the selector matches more than one element.
+    page.locator(selector).first.click(timeout=config.DEFAULT_TIMEOUT * 1000)
 
 
-def _type(driver: webdriver.Chrome, selector: str, text: str) -> None:
-    el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
-        EC.visibility_of_element_located((By.CSS_SELECTOR, selector))
-    )
-    el.clear()
-    el.send_keys(text)
+def _type(page: Page, selector: str, text: str) -> None:
+    # fill() clears the field first, matching the old clear()+send_keys().
+    page.locator(selector).first.fill(text, timeout=config.DEFAULT_TIMEOUT * 1000)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────

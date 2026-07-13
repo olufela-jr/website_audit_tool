@@ -1,14 +1,18 @@
 """
 Tiny local web front end for the GTM / GA4 verifier.
 
-Audits are split into two streams by what access they require:
+Audits are split into two streams by what they DO to the target site:
 
-  • Public    — outside-in checks on any public URL, no affiliation or access
-                needed (tags, analytics, consent, network). All browser-based.
-  • Authorized — checks that need client-granted access: a server fetch from an
-                allow-listed host, or GTM container access (security headers,
-                SEO). These only run when the operator confirms authorized
-                access; otherwise they are skipped as "access required".
+  • Passive     — observation only: load the page like any visitor and watch
+                  what the site does on its own (tags, SEO, security headers,
+                  analytics, consent, network). Safe on any public URL,
+                  including prospects we have no relationship with.
+  • Interactive — dataLayer journeys from an uploaded site config. These drive
+                  the site: click funnels, submit forms with test data,
+                  potentially place test orders — creating state on the site
+                  and firing events into the client's production GA4. They only
+                  run when the operator confirms client-granted authorization;
+                  otherwise they are skipped as "access required".
 
 Enter a URL, pick audits, see an HTML report, download the PowerPoint.
 
@@ -40,6 +44,7 @@ if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 
 import analytics  # noqa: E402
+import browser  # noqa: E402
 import config  # noqa: E402
 import consent  # noqa: E402
 import journeys as journeys_mod  # noqa: E402
@@ -52,40 +57,41 @@ from export import export_to_powerpoint  # noqa: E402
 
 app = Flask(__name__)
 
-# Form field the operator ticks to confirm they have authorized access to the
-# target (allow-listed host / GTM container access). Honour system — the tool
-# does not verify it; if access isn't really there the fetch just fails and the
-# audit skips as "access required".
+# Form field the operator ticks to confirm the client has authorized us to
+# drive their site (journeys submit forms and can place test orders). Honour
+# system — the tool does not verify it.
 ACCESS_FIELD = "authorized"
 
-# Audits split into two streams by the access they require. Each item is
-# (key, label, fn) where fn takes a URL and returns List[CheckResult].
-# `requires_access` marks the Authorized stream: gated behind ACCESS_FIELD.
+# Audits split into two streams by what they do to the target site. Each item
+# is (key, label, fn) where fn takes a URL and returns List[CheckResult].
+# `requires_access` marks the Interactive stream: gated behind ACCESS_FIELD.
 AUDIT_GROUPS = [
     {
-        "id": "public",
-        "title": "Public audit",
-        "blurb": "Outside-in checks anyone can run on a public URL — no affiliation or access required.",
+        "id": "passive",
+        "title": "Passive audit",
+        "blurb": "Observation only — loads the page like a normal visitor and watches what "
+                 "the site does. Safe to run on any public URL, prospects included.",
         "default": True,
         "requires_access": False,
-        "items": [
-            ("tags", "Tag & pixel inventory", tags_inventory.run_tag_inventory_audit),
-            ("seo", "SEO & metadata", seo.run_seo_audit),
-        ],
-    },
-    {
-        "id": "authorized",
-        "title": "Authorized audit",
-        "blurb": "Implementation, consent, network and security checks — shown only with "
-                 "client-granted access. Tick below to confirm access and enable them.",
-        "default": False,
-        "requires_access": True,
         "items": [
             ("analytics", "Analytics setup", analytics.run_analytics_audit),
             ("consent", "Consent & privacy", consent.run_consent_audit),
             ("network", "Network / collect", network.run_network_audit),
+            ("tags", "Tag & pixel inventory", tags_inventory.run_tag_inventory_audit),
+            ("seo", "SEO & metadata", seo.run_seo_audit),
             ("security", "Security headers", security_headers.run_security_headers_audit),
         ],
+    },
+    {
+        "id": "interactive",
+        "title": "Interactive audit",
+        "blurb": "Drives the site: dataLayer journeys click through funnels, submit forms "
+                 "with test data and can place test orders — creating state on the site and "
+                 "firing events into the client's production analytics. Client permission "
+                 "required; tick below to confirm and enable.",
+        "default": False,
+        "requires_access": True,
+        "items": [],
     },
 ]
 
@@ -207,55 +213,60 @@ def run_audit():
 
     authorized = bool(request.form.get(ACCESS_FIELD))
 
+    # One shared browser process for the whole request; each audit/journey
+    # still gets a fresh isolated context (browser.audit_page). The session
+    # lives entirely on this request thread — Playwright's sync API is
+    # thread-affine, so it must never be shared across requests.
     journey_results: List[Tuple[str, List[CheckResult]]] = []
-    for name in selected:
-        label, fn = AUDITS[name]
-        # Authorized-stream audits only run when the operator confirms access.
-        # Without it they're skipped (score-neutral), never failed.
-        if name in _AUTHORIZED_KEYS and not authorized:
-            checks = [skip_check(
-                label,
-                "Not assessed — access required: confirm authorized access to run this audit.",
-                Severity.HIGH,
-            )]
+    with browser.browser_session():
+        for name in selected:
+            label, fn = AUDITS[name]
+            # Authorized-stream audits only run when the operator confirms access.
+            # Without it they're skipped (score-neutral), never failed.
+            if name in _AUTHORIZED_KEYS and not authorized:
+                checks = [skip_check(
+                    label,
+                    "Not assessed — access required: confirm authorized access to run this audit.",
+                    Severity.HIGH,
+                )]
+                journey_results.append((name, checks))
+                continue
+            try:
+                if name == "analytics" and site_config is not None:
+                    # Verify the uploaded config's expected tag IDs against the site
+                    checks = analytics.run_analytics_audit(
+                        url, expected_gtm_id=config.GTM_ID, expected_ga4_id=config.GA4_ID
+                    )
+                else:
+                    checks = fn(url)
+            except Exception as exc:  # one bad audit shouldn't 500 the whole page
+                tb = traceback.format_exc()
+                checks = [failed_check(name, f"Audit crashed: {exc}\n{tb}")]
             journey_results.append((name, checks))
-            continue
-        try:
-            if name == "analytics" and site_config is not None:
-                # Verify the uploaded config's expected tag IDs against the site
-                checks = analytics.run_analytics_audit(
-                    url, expected_gtm_id=config.GTM_ID, expected_ga4_id=config.GA4_ID
-                )
-            else:
-                checks = fn(url)
-        except Exception as exc:  # one bad audit shouldn't 500 the whole page
-            tb = traceback.format_exc()
-            checks = [failed_check(name, f"Audit crashed: {exc}\n{tb}")]
-        journey_results.append((name, checks))
 
-    # dataLayer journeys from the uploaded config (Authorized stream)
-    if run_journeys:
-        if not authorized:
-            journey_results.append(("journeys", [skip_check(
-                "Journey verification",
-                "Not assessed — access required: confirm authorized access to run journeys.",
-                Severity.HIGH,
-            )]))
-        elif not site_journeys:
-            journey_results.append(("journeys", [skip_check(
-                "Journey verification",
-                "No config uploaded (or it has no 'journeys:' section) — "
-                "upload a site config YAML to run dataLayer journeys.",
-                Severity.HIGH,
-            )]))
-        else:
-            for jname, spec in site_journeys.items():
-                try:
-                    checks = journeys_mod.run_journey(jname, spec)
-                except Exception as exc:
-                    tb = traceback.format_exc()
-                    checks = [failed_check(jname, f"Journey crashed: {exc}\n{tb}")]
-                journey_results.append((jname, checks))
+        # dataLayer journeys from the uploaded config (Authorized stream)
+        if run_journeys:
+            if not authorized:
+                journey_results.append(("journeys", [skip_check(
+                    "Journey verification",
+                    "Not assessed — access required: confirm authorized access to run journeys.",
+                    Severity.HIGH,
+                )]))
+            elif not site_journeys:
+                journey_results.append(("journeys", [skip_check(
+                    "Journey verification",
+                    "No config uploaded (or it has no 'journeys:' section) — "
+                    "upload a site config YAML to run dataLayer journeys.",
+                    Severity.HIGH,
+                )]))
+            else:
+                for jname, spec in site_journeys.items():
+                    try:
+                        checks = journeys_mod.run_journey(jname, spec)
+                    except Exception as exc:
+                        tb = traceback.format_exc()
+                        checks = [failed_check(jname, f"Journey crashed: {exc}\n{tb}")]
+                    journey_results.append((jname, checks))
 
     _prune_cache()
     run_id = uuid.uuid4().hex

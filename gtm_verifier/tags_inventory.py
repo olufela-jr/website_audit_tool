@@ -1,8 +1,8 @@
 """
 Tag & pixel inventory — publicly observable, no site access required.
 
-Loads the page in Chrome, accepts consent, and records every network request
-URL (via CDP performance logging) plus a set of known JavaScript globals. Each
+Loads the page in a browser, accepts consent, and records every network request
+URL (via Playwright request events) plus a set of known JavaScript globals. Each
 is matched against a signature table of common analytics / advertising vendors
 so the report can list "here is everything firing on your site".
 
@@ -15,15 +15,13 @@ identity. Those two checks move the score, so the journey reports a real
 pass/fail instead of an all-INFO 0/0.
 """
 
-import json
 import re
-import time
 from typing import Dict, List, Set
 
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from playwright.sync_api import Error as PlaywrightError, Page
 
-from core import CheckResult, Severity, accept_consent, failed_check, make_driver
+from browser import audit_page
+from core import CheckResult, Severity, accept_consent, failed_check
 
 _RE_GTM_ID = re.compile(r'GTM-[A-Z0-9]{4,}')
 _RE_GA4_ID = re.compile(r'G-[A-Z0-9]{6,}')
@@ -51,60 +49,39 @@ _SIGNATURES: Dict[str, Dict[str, List[str]]] = {
 }
 
 
-def _drain_all_request_urls(driver: webdriver.Chrome) -> Set[str]:
-    """Drain the CDP performance log and return every request URL seen.
-    Destructive read — the buffer is cleared, so callers accumulate across calls."""
-    urls: Set[str] = set()
-    try:
-        raw_logs = driver.get_log("performance")
-    except Exception:  # noqa: BLE001
-        return urls
-    for entry in raw_logs:
-        try:
-            msg = json.loads(entry["message"])["message"]
-            if msg.get("method") != "Network.requestWillBeSent":
-                continue
-            url = msg["params"]["request"].get("url", "")
-            if url:
-                urls.add(url)
-        except (KeyError, json.JSONDecodeError, TypeError):
-            continue
-    return urls
-
-
-def _detect_globals(driver: webdriver.Chrome, names: List[str]) -> Set[str]:
+def _detect_globals(page: Page, names: List[str]) -> Set[str]:
     """Return the subset of JS global names that are defined on the page."""
     try:
-        present = driver.execute_script(
-            "return arguments[0].filter(function(n){return typeof window[n] !== 'undefined';})",
+        present = page.evaluate(
+            "(names) => names.filter(function(n){return typeof window[n] !== 'undefined';})",
             names,
         )
         return set(present or [])
-    except WebDriverException:
+    except PlaywrightError:
         return set()
 
 
-def _live_gtm_containers(driver: webdriver.Chrome) -> Set[str]:
+def _live_gtm_containers(page: Page) -> Set[str]:
     """GTM container IDs that are live on the page (most authoritative signal).
     Reads the keys of window.google_tag_manager, which GTM populates per
     container once gtm.js has run."""
     try:
-        keys = driver.execute_script(
-            "return Object.keys(window.google_tag_manager || {})"
+        keys = page.evaluate(
+            "Object.keys(window.google_tag_manager || {})"
         ) or []
-    except WebDriverException:
+    except PlaywrightError:
         return set()
     return {k for k in keys if k.startswith("GTM-")}
 
 
 def _tag_presence_checks(
-    driver: webdriver.Chrome, seen_urls: Set[str]
+    page: Page, seen_urls: Set[str]
 ) -> List[CheckResult]:
     """Scored pass/fail checks for a public audit: is GTM running, and is GA4
     running? Presence + count, not identity — there's no expected ID to match
     on a site you have no access to. Each lists what was found."""
     url_blob = " ".join(seen_urls)
-    found_gtm = sorted(_live_gtm_containers(driver) | set(_RE_GTM_ID.findall(url_blob)))
+    found_gtm = sorted(_live_gtm_containers(page) | set(_RE_GTM_ID.findall(url_blob)))
     # GA4 IDs appear as id=G-XXXX (gtag/js loader) and tid=G-XXXX (g/collect hits).
     found_ga4 = sorted(set(_RE_GA4_ID.findall(url_blob)))
 
@@ -130,59 +107,57 @@ def _tag_presence_checks(
 
 
 def run_tag_inventory_audit(url: str) -> List[CheckResult]:
-    driver = make_driver(performance_logging=True)
     results: List[CheckResult] = []
     try:
-        driver.get(url)
-        accept_consent(driver)
-
-        # Accumulate request URLs over a short window (tags fire asynchronously).
-        seen_urls: Set[str] = set()
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            seen_urls |= _drain_all_request_urls(driver)
-            time.sleep(0.3)
-        seen_urls |= _drain_all_request_urls(driver)
-
-        all_globals = sorted({g for sig in _SIGNATURES.values() for g in sig["globals"]})
-        present_globals = _detect_globals(driver, all_globals)
-
-        detected: List[str] = []
-        for vendor, sig in _SIGNATURES.items():
-            url_hits = [u for u in sig["urls"] if any(u in seen for seen in seen_urls)]
-            global_hits = [g for g in sig["globals"] if g in present_globals]
-            if not url_hits and not global_hits:
-                continue
-            detected.append(vendor)
-            how = []
-            if url_hits:
-                how.append("network: " + ", ".join(sorted(set(url_hits))))
-            if global_hits:
-                how.append("JS global: " + ", ".join(global_hits))
-            results.append(CheckResult(
-                name=vendor, event=None, passed=True,
-                detail=" | ".join(how), severity=Severity.INFO,
-            ))
-
-        # Scored checks: is GTM running, is GA4 running (presence + count).
-        # HIGH severity so they count toward the journey score.
-        scored = _tag_presence_checks(driver, seen_urls)
-
-        # Summary first-ish line for the report header.
-        summary = CheckResult(
-            name="Tags detected",
-            event=None,
-            passed=True,
-            detail=(f"{len(detected)} vendor(s): {', '.join(detected)}" if detected
-                    else "No known analytics/advertising tags detected"),
-            severity=Severity.INFO,
-        )
-        # Order in report: summary (INFO), scored gates, then per-vendor inventory.
-        results = [summary, *scored, *results]
-
-    except WebDriverException as exc:
-        results.append(failed_check("tag_inventory", f"Driver error: {exc}", Severity.HIGH))
-    finally:
-        driver.quit()
-
+        with audit_page(capture_network=True) as (page, recorder):
+            return _inventory_checks(page, recorder, url)
+    except PlaywrightError as exc:
+        results.append(failed_check("tag_inventory", f"Browser error: {exc}", Severity.HIGH))
     return results
+
+
+def _inventory_checks(page: Page, recorder, url: str) -> List[CheckResult]:
+    results: List[CheckResult] = []
+    page.goto(url)
+    accept_consent(page)
+
+    # Wait a short window for tags to fire asynchronously; the recorder
+    # has been listening since before navigation.
+    page.wait_for_timeout(8000)
+    seen_urls: Set[str] = recorder.all_urls()
+
+    all_globals = sorted({g for sig in _SIGNATURES.values() for g in sig["globals"]})
+    present_globals = _detect_globals(page, all_globals)
+
+    detected: List[str] = []
+    for vendor, sig in _SIGNATURES.items():
+        url_hits = [u for u in sig["urls"] if any(u in seen for seen in seen_urls)]
+        global_hits = [g for g in sig["globals"] if g in present_globals]
+        if not url_hits and not global_hits:
+            continue
+        detected.append(vendor)
+        how = []
+        if url_hits:
+            how.append("network: " + ", ".join(sorted(set(url_hits))))
+        if global_hits:
+            how.append("JS global: " + ", ".join(global_hits))
+        results.append(CheckResult(
+            name=vendor, event=None, passed=True,
+            detail=" | ".join(how), severity=Severity.INFO,
+        ))
+
+    # Scored checks: is GTM running, is GA4 running (presence + count).
+    # HIGH severity so they count toward the journey score.
+    scored = _tag_presence_checks(page, seen_urls)
+
+    # Summary first-ish line for the report header.
+    summary = CheckResult(
+        name="Tags detected",
+        event=None,
+        passed=True,
+        detail=(f"{len(detected)} vendor(s): {', '.join(detected)}" if detected
+                else "No known analytics/advertising tags detected"),
+        severity=Severity.INFO,
+    )
+    # Order in report: summary (INFO), scored gates, then per-vendor inventory.
+    return [summary, *scored, *results]

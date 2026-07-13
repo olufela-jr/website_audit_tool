@@ -1,6 +1,9 @@
-# Selenium 4.6+ ships with Selenium Manager, which auto-downloads chromedriver.
-# No separate chromedriver installation is required as long as Chrome is installed.
-selenium>=4.25.0
+# Playwright drives its own bundled Chromium — no system Chrome or chromedriver
+# needed. After installing, download the browser once with:
+#   python -m playwright install chromium
+# Pinned exactly: the Dockerfile's base-image tag must ship the same version,
+# so bump both together.
+playwright==1.60.0
 PyYAML>=6.0
 python-pptx>=0.6.23
 

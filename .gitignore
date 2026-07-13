@@ -31,3 +31,7 @@ build/
 # Copy gtm_verifier/config.example.yaml to config.yaml and fill it in.
 gtm_verifier/config.yaml
 *.local.yaml
+
+# Claude Code
+.claude/
+CLAUDE.md

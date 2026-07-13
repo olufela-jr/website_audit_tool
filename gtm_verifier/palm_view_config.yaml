@@ -27,7 +27,7 @@ tags:
   ga4_id: "G-JXWM0TX7FS"     # loaded by GTM at runtime
 
 timeouts:
-  default: 10       # seconds — WebDriverWait for DOM elements
+  default: 10       # seconds — element wait for DOM interactions
   event_poll: 15    # seconds — dataLayer event polling
 
 selectors:

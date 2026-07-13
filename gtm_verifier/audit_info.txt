@@ -23,9 +23,9 @@ SCORING (core.py → score_checks)
   => INFO and SKIP rows never change the %.  Only PASS/FAIL do.
 
 HOW DATA IS GATHERED
-  • Browser audits (tags, analytics, consent, network): real Chrome via Selenium.
-    Network requests are read from the Chrome DevTools Protocol "performance" log
-    (CDP event Network.requestWillBeSent). The dataLayer is read with
+  • Browser audits (tags, analytics, consent, network): real Chromium via
+    Playwright. Network requests are captured with page request/response event
+    listeners (browser.NetworkRecorder). The dataLayer is read with
     `window.dataLayer`. JS globals with `typeof window.X`.
   • Fetch audits (SEO, security): resilient_fetch() — a raw HTTP GET first; if a
     WAF/bot filter blocks it, it falls back to an in-page fetch() inside Chrome,

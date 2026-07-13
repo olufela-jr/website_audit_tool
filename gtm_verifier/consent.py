@@ -11,21 +11,29 @@ Evaluates:
 import time
 from typing import List, Optional
 
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.common.by import By
+from playwright.sync_api import Error as PlaywrightError, Page
 
+from browser import audit_page
 from core import (
     CheckResult,
     Severity,
     accept_consent,
     failed_check,
     get_datalayer_length,
-    make_driver,
     skip_check,
 )
-from network import extract_collect_requests, gcs_analytics_storage_granted
+from network import gcs_analytics_storage_granted
 import config
+
+# Live window.dataLayer read with a per-entry sanitizer: Playwright's evaluate
+# serialisation throws on circular refs (e.g. gtm.element DOM nodes) where
+# Selenium degraded gracefully, so each entry is JSON-roundtripped in-page and
+# unserialisable ones become null (skipped by the pure helpers).
+_DL_LIVE_READ_JS = """
+(window.dataLayer || []).map(e => {
+    try { return JSON.parse(JSON.stringify(e)); } catch (err) { return null; }
+})
+"""
 
 
 # ── CMP detection ─────────────────────────────────────────────────────────────
@@ -60,20 +68,22 @@ _CONSENT_SIGNALS = [
 ]
 
 
-def _detect_cmp(driver: webdriver.Chrome) -> Optional[str]:
+def _detect_cmp(page: Page) -> Optional[str]:
     """
     Scan the DOM for known CMP vendor signatures and the TCF __tcfapi.
     Returns a human-readable label of what was found, or None.
     """
     # TCF 2.0 API is the vendor-neutral signal — check first
-    has_tcf = driver.execute_script("return typeof window.__tcfapi === 'function'")
+    has_tcf = page.evaluate("typeof window.__tcfapi === 'function'")
     if has_tcf:
         return "TCF 2.0 API (__tcfapi) present"
 
     for selector, label in _CMP_SELECTORS:
         try:
-            els = driver.find_elements(By.CSS_SELECTOR, selector)
-            if any(el.is_displayed() for el in els):
+            loc = page.locator(selector)
+            # is_visible() takes an immediate snapshot (no auto-wait), matching
+            # the old find_elements + is_displayed semantics.
+            if any(loc.nth(i).is_visible() for i in range(loc.count())):
                 return f"{label}  ({selector})"
         except Exception:
             continue
@@ -86,8 +96,8 @@ def _gtag_args(entry) -> Optional[list]:
     or None if it is not one.
 
     gtag() does `dataLayer.push(arguments)`, pushing the function's arguments
-    object. Because that object is array-like but NOT a true Array, Selenium /
-    JSON serialisation renders it either as:
+    object. Because that object is array-like but NOT a true Array, JSON
+    serialisation renders it either as:
       - a list  ['consent', 'default', {...}]                     (true Array), or
       - a dict  {'0': 'consent', '1': 'default', '2': {...}}      (arguments object)
     A normal dataLayer.push({...}) has named keys and yields None here.
@@ -123,9 +133,9 @@ def _extract_consent_default(data_layer) -> Optional[dict]:
     return None
 
 
-def _get_consent_mode_state(driver: webdriver.Chrome) -> Optional[dict]:
+def _get_consent_mode_state(page: Page) -> Optional[dict]:
     """Read window.dataLayer and return the gtag consent-default state dict."""
-    data_layer = driver.execute_script("return window.dataLayer || []") or []
+    data_layer = page.evaluate(_DL_LIVE_READ_JS) or []
     return _extract_consent_default(data_layer)
 
 
@@ -265,135 +275,138 @@ def run_consent_audit(url: str) -> List[CheckResult]:
 
     Loads the page WITHOUT accepting consent first so pre-consent collect
     requests can be detected, then accepts consent to verify the update.
-    Uses a performance-logging driver for network capture.
+    The fresh browser context guarantees no stored consent state carries over.
     """
-    driver = make_driver(performance_logging=True)
     results: List[CheckResult] = []
     try:
-        driver.get(url)
-        # Deliberately do NOT accept consent here yet — pre-consent checks first.
+        with audit_page(capture_network=True) as (page, recorder):
+            return _consent_checks(page, recorder, url)
+    except PlaywrightError as exc:
+        results.append(failed_check(
+            "consent_audit", f"Browser error: {exc}", Severity.CRITICAL
+        ))
+    return results
 
-        # ── Check 1: CMP banner / TCF API present ─────────────────────────
-        cmp_label = _detect_cmp(driver)
-        if cmp_label:
-            results.append(CheckResult(
-                name="CMP banner detected",
-                event=None,
-                passed=True,
-                detail=cmp_label,
-                severity=Severity.MEDIUM,
-            ))
-        else:
-            results.append(failed_check(
-                "CMP banner detected",
-                "No CMP banner or TCF API found in DOM — consent management may be absent",
-                Severity.MEDIUM,
-            ))
 
-        # ── Check 2: Consent Mode implemented ────────────────────────────
-        state = _get_consent_mode_state(driver)
-        if state is not None:
-            results.append(CheckResult(
-                name="Consent Mode implemented",
-                event=None,
-                passed=True,
-                detail=f"gtag consent default in dataLayer: {state}",
-                severity=Severity.CRITICAL,
-            ))
-        else:
-            results.append(failed_check(
-                "Consent Mode implemented",
-                "No gtag consent default push found in window.dataLayer — Consent Mode not configured",
-                Severity.CRITICAL,
-            ))
+def _consent_checks(page: Page, recorder, url: str) -> List[CheckResult]:
+    results: List[CheckResult] = []
+    page.goto(url)
+    # Deliberately do NOT accept consent here yet — pre-consent checks first.
 
-        # ── Check 3: Default state per signal ────────────────────────────
-        if state is not None:
-            for signal in _CONSENT_SIGNALS:
-                value = state.get(signal)
-                if value == "denied":
-                    results.append(CheckResult(
-                        name=f"Default denied: {signal}",
-                        event=None,
-                        passed=True,
-                        detail=f"{signal} = 'denied'",
-                        severity=Severity.HIGH,
-                    ))
-                elif value is None:
-                    results.append(failed_check(
-                        f"Default denied: {signal}",
-                        f"{signal} not present in consent default — signal not configured",
-                        Severity.HIGH,
-                    ))
-                else:
-                    results.append(failed_check(
-                        f"Default denied: {signal}",
-                        f"{signal} = '{value}' (expected 'denied')",
-                        Severity.HIGH,
-                    ))
-        else:
-            for signal in _CONSENT_SIGNALS:
-                results.append(skip_check(
+    # ── Check 1: CMP banner / TCF API present ─────────────────────────
+    cmp_label = _detect_cmp(page)
+    if cmp_label:
+        results.append(CheckResult(
+            name="CMP banner detected",
+            event=None,
+            passed=True,
+            detail=cmp_label,
+            severity=Severity.MEDIUM,
+        ))
+    else:
+        results.append(failed_check(
+            "CMP banner detected",
+            "No CMP banner or TCF API found in DOM — consent management may be absent",
+            Severity.MEDIUM,
+        ))
+
+    # ── Check 2: Consent Mode implemented ────────────────────────────
+    state = _get_consent_mode_state(page)
+    if state is not None:
+        results.append(CheckResult(
+            name="Consent Mode implemented",
+            event=None,
+            passed=True,
+            detail=f"gtag consent default in dataLayer: {state}",
+            severity=Severity.CRITICAL,
+        ))
+    else:
+        results.append(failed_check(
+            "Consent Mode implemented",
+            "No gtag consent default push found in window.dataLayer — Consent Mode not configured",
+            Severity.CRITICAL,
+        ))
+
+    # ── Check 3: Default state per signal ────────────────────────────
+    if state is not None:
+        for signal in _CONSENT_SIGNALS:
+            value = state.get(signal)
+            if value == "denied":
+                results.append(CheckResult(
+                    name=f"Default denied: {signal}",
+                    event=None,
+                    passed=True,
+                    detail=f"{signal} = 'denied'",
+                    severity=Severity.HIGH,
+                ))
+            elif value is None:
+                results.append(failed_check(
                     f"Default denied: {signal}",
-                    "Skipped — Consent Mode not implemented",
+                    f"{signal} not present in consent default — signal not configured",
                     Severity.HIGH,
                 ))
+            else:
+                results.append(failed_check(
+                    f"Default denied: {signal}",
+                    f"{signal} = '{value}' (expected 'denied')",
+                    Severity.HIGH,
+                ))
+    else:
+        for signal in _CONSENT_SIGNALS:
+            results.append(skip_check(
+                f"Default denied: {signal}",
+                "Skipped — Consent Mode not implemented",
+                Severity.HIGH,
+            ))
 
-        # ── Check 4: Pre-consent GA4 firing ───────────────────────────────
-        # Poll with a short timeout — on compliant sites the pre-consent pings
-        # are denied, so we should not wait the full event timeout. The
-        # compliant-vs-violation classification lives in a pure helper so it
-        # can be unit-tested without a browser.
-        pre_requests = extract_collect_requests(driver, timeout=5.0)
-        results.append(_pre_consent_firing_result(pre_requests))
+    # ── Check 4: Pre-consent GA4 firing ───────────────────────────────
+    # Poll with a short timeout — on compliant sites the pre-consent pings
+    # are denied, so we should not wait the full event timeout. The
+    # compliant-vs-violation classification lives in a pure helper so it
+    # can be unit-tested without a browser.
+    pre_requests = recorder.drain_collect(timeout=5.0)
+    results.append(_pre_consent_firing_result(pre_requests))
 
-        # ── Check 5: Post-consent update ──────────────────────────────────
-        pre_accept_idx = get_datalayer_length(driver)
-        accept_consent(driver)
+    # ── Check 5: Post-consent update ──────────────────────────────────
+    pre_accept_idx = get_datalayer_length(page)
+    accept_consent(page)
 
-        # Consent update events vary by CMP — check common names and nested structures
-        _CONSENT_UPDATE_EVENTS = {
-            "consent_update",       # generic / custom GTM
-            "gtm_consent_update",   # ClearCookie via GTM
-            "clearcookie_save_preferences",  # ClearCookie native
-            "CookieInformationConsentGiven", # Cookie Information
-            "cookieyes-consent-update",      # CookieYes
-        }
+    # Consent update events vary by CMP — check common names and nested structures
+    _CONSENT_UPDATE_EVENTS = {
+        "consent_update",       # generic / custom GTM
+        "gtm_consent_update",   # ClearCookie via GTM
+        "clearcookie_save_preferences",  # ClearCookie native
+        "CookieInformationConsentGiven", # Cookie Information
+        "cookieyes-consent-update",      # CookieYes
+    }
 
-        consent_update_found = False
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            dl = driver.execute_script("return window.dataLayer || []") or []
-            for entry in dl[pre_accept_idx:]:
-                if not isinstance(entry, dict):
-                    continue
-                # Top-level event key
-                if entry.get("event") in _CONSENT_UPDATE_EVENTS:
+    consent_update_found = False
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        dl = page.evaluate(_DL_LIVE_READ_JS) or []
+        for entry in dl[pre_accept_idx:]:
+            if not isinstance(entry, dict):
+                continue
+            # Top-level event key
+            if entry.get("event") in _CONSENT_UPDATE_EVENTS:
+                consent_update_found = True
+                break
+            # Nested value.event (GTM internal consent push pattern)
+            if isinstance(entry.get("value"), dict):
+                if entry["value"].get("event") in _CONSENT_UPDATE_EVENTS:
                     consent_update_found = True
                     break
-                # Nested value.event (GTM internal consent push pattern)
-                if isinstance(entry.get("value"), dict):
-                    if entry["value"].get("event") in _CONSENT_UPDATE_EVENTS:
-                        consent_update_found = True
-                        break
-            if consent_update_found:
-                break
-            time.sleep(0.3)
+        if consent_update_found:
+            break
+        page.wait_for_timeout(300)
 
-        post_requests = extract_collect_requests(driver, timeout=5.0)
+    post_requests = recorder.drain_collect(timeout=5.0)
 
-        # Authoritative check: did analytics_storage actually flip to granted
-        # across the accept click? The consent_update dataLayer event is only a
-        # supporting signal. Classification lives in a pure, unit-testable helper.
-        results.append(_post_consent_transition_result(
-            pre_requests, post_requests, consent_update_found
-        ))
-
-    except WebDriverException as exc:
-        results.append(failed_check(
-            "consent_audit", f"Driver error: {exc}", Severity.CRITICAL
-        ))
-    finally:
-        driver.quit()
+    # Authoritative check: did analytics_storage actually flip to granted
+    # across the accept click? The consent_update dataLayer event is only a
+    # supporting signal. Classification lives in a pure, unit-testable helper.
+    results.append(_post_consent_transition_result(
+        pre_requests, post_requests, consent_update_found
+    ))
 
     return results

@@ -1,0 +1,11 @@
+venv/
+notes/
+.git/
+**/__pycache__/
+*.pptx
+
+# Client configs never ship in the image — config.yaml auto-loads on import,
+# which would point a fresh deployment at a real client site (see
+# notes/cloud-followups.md #5). Supply config at runtime via upload instead.
+gtm_verifier/config.yaml
+gtm_verifier/palm_view_config.yaml

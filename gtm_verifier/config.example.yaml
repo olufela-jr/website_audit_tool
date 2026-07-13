@@ -24,7 +24,7 @@ tags:
   ga4_id: "G-XXXXXXXXXX"
 
 timeouts:
-  default: 10       # seconds — WebDriverWait for DOM elements
+  default: 10       # seconds — element wait for DOM interactions
   event_poll: 15    # seconds — dataLayer event polling
 
 selectors:

@@ -22,6 +22,7 @@ import sys
 import traceback
 from typing import Callable, Dict, List, Tuple
 
+import browser
 import config  # auto-loads config.yaml on import when present
 from core import CheckResult, failed_check, print_report
 from export import export_to_powerpoint
@@ -153,7 +154,10 @@ def main() -> None:
         requested = list(SITE_AUDITS) + list(config.JOURNEYS)
 
     print(f"Target: {config.BASE_URL}")
-    journey_results = _run(requested, available)
+    # One shared browser process for the whole run; each audit still gets a
+    # fresh isolated context (see browser.audit_page).
+    with browser.browser_session():
+        journey_results = _run(requested, available)
     if not journey_results:
         print("No audits were run.", file=sys.stderr)
         sys.exit(1)

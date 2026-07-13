@@ -37,15 +37,12 @@ the journey is reported as blocked and the journey stops.
 """
 
 import re
-import time
 from typing import Any, List, Tuple
 
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select, WebDriverWait
+from playwright.sync_api import Error as PlaywrightError
 
 import config
+from browser import audit_page
 from analytics import run_analytics_audit
 from consent import run_consent_audit
 from network import run_network_audit
@@ -61,7 +58,6 @@ from core import (
     check_event,
     failed_check,
     get_datalayer_length,
-    make_driver,
     skip_check,
 )
 
@@ -118,54 +114,50 @@ def _resolve_path(entry: Any, path: str) -> Any:
 
 # ── Step execution ────────────────────────────────────────────────────────────
 
-def _settle(driver) -> None:
+def _settle(page) -> None:
     """Let a click-triggered navigation commit before the next step. Without
     this, a goto right after a form-submitting click can cancel the in-flight
     request (e.g. an add-to-cart POST), leaving the site in the wrong state."""
-    time.sleep(0.3)  # give the navigation a beat to start
-    deadline = time.monotonic() + config.DEFAULT_TIMEOUT
-    while time.monotonic() < deadline:
-        try:
-            if driver.execute_script("return document.readyState") == "complete":
-                return
-        except WebDriverException:
-            pass  # document mid-swap
-        time.sleep(0.2)
+    try:
+        page.wait_for_timeout(300)  # give the navigation a beat to start
+        page.wait_for_load_state("load", timeout=config.DEFAULT_TIMEOUT * 1000)
+    except PlaywrightError:
+        pass  # best effort — never raise from a settle wait
 
 
-def _run_action(driver, kind: str, arg: Any, idx: int) -> int:
+def _run_action(page, kind: str, arg: Any, idx: int) -> int:
     """Perform one action step; returns the new dataLayer marker index."""
     if kind == "goto":
-        new_idx = get_datalayer_length(driver)
-        driver.get(_absolute(arg))
+        new_idx = get_datalayer_length(page)
+        page.goto(_absolute(arg))
         return new_idx
     if kind == "accept_consent":
-        accept_consent(driver)
+        accept_consent(page)
         return idx  # deliberately does not move the marker
     if kind == "mark":
-        return get_datalayer_length(driver)
+        return get_datalayer_length(page)
 
-    new_idx = get_datalayer_length(driver)
+    new_idx = get_datalayer_length(page)
     if kind == "click":
-        _click(driver, str(arg))
-        _settle(driver)
+        _click(page, str(arg))
+        _settle(page)
     elif kind == "type":
-        _type(driver, str(arg["selector"]), str(arg.get("text", "")))
+        _type(page, str(arg["selector"]), str(arg.get("text", "")))
     elif kind == "select_index":
-        el = WebDriverWait(driver, config.DEFAULT_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, str(arg["selector"])))
+        page.locator(str(arg["selector"])).first.select_option(
+            index=int(arg.get("index", 1)),
+            timeout=config.DEFAULT_TIMEOUT * 1000,
         )
-        Select(el).select_by_index(int(arg.get("index", 1)))
     return new_idx
 
 
-def _run_expect(driver, spec: dict, idx: int) -> List[CheckResult]:
+def _run_expect(page, spec: dict, idx: int) -> List[CheckResult]:
     event = spec.get("event")
     if not event:
         return [failed_check("expect", f"journey config error: 'expect' needs an 'event' name, got {spec!r}")]
     severity = _severity(spec)
     result = check_event(
-        driver,
+        page,
         event,
         [str(f) for f in (spec.get("require") or [])],
         idx,
@@ -215,13 +207,12 @@ def run_journey(name: str, spec: dict) -> List[CheckResult]:
     except ValueError as exc:
         return [failed_check(name, f"journey config error: {exc}")]
 
-    driver = make_driver()
     results: List[CheckResult] = []
     idx = 0
-    try:
+    with audit_page() as (page, _):
         for pos, (kind, arg) in enumerate(parsed):
             if kind == "expect":
-                results.extend(_run_expect(driver, arg or {}, idx))
+                results.extend(_run_expect(page, arg or {}, idx))
                 continue
             if kind == "skip":
                 arg = arg or {}
@@ -230,8 +221,8 @@ def run_journey(name: str, spec: dict) -> List[CheckResult]:
                 ))
                 continue
             try:
-                idx = _run_action(driver, kind, arg, idx)
-            except (TimeoutException, WebDriverException, ValueError, KeyError) as exc:
+                idx = _run_action(page, kind, arg, idx)
+            except (PlaywrightError, ValueError, KeyError) as exc:
                 detail = f"step {pos + 1} ({_step_desc(kind, arg)}) failed: {exc}"
                 blocked = [a or {} for k, a in parsed[pos + 1:] if k == "expect"]
                 if blocked:
@@ -244,8 +235,6 @@ def run_journey(name: str, spec: dict) -> List[CheckResult]:
                 else:
                     results.append(failed_check(name, detail))
                 break
-    finally:
-        driver.quit()
     return results
 
 

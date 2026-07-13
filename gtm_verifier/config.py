@@ -29,7 +29,7 @@ BASE_URL: Optional[str] = None
 GTM_ID: Optional[str] = None         # expected GTM container — verified against the live site when set
 GA4_ID: Optional[str] = None         # expected GA4 measurement ID — verified when set
 
-DEFAULT_TIMEOUT = 10                 # seconds — WebDriverWait for DOM elements
+DEFAULT_TIMEOUT = 10                 # seconds — element wait for DOM interactions
 EVENT_POLL_TIMEOUT = 15              # seconds — dataLayer event polling
 
 CONSENT_ACCEPT_BUTTON: Optional[str] = None  # site-specific CMP accept selector (common CMPs are auto-detected)

@@ -82,10 +82,10 @@
     <fieldset class="{{ 'authorized' if group.requires_access else 'public' }}" data-stream="{{ group.id }}">
       <legend>{{ group.title }}</legend>
       <p class="blurb">{{ group.blurb }}</p>
-      {% if group.requires_access and group['items'] %}
+      {% if group.requires_access %}
       <div class="access-toggle">
         <input type="checkbox" id="authorized" name="authorized">
-        <label for="authorized"><strong>I have authorized access to this site</strong>
+        <label for="authorized"><strong>The client has authorized us to drive this site</strong>
           &mdash; enable these audits. Without it they're reported as “access required”.</label>
       </div>
       {% endif %}
@@ -110,7 +110,7 @@
           without code changes; also lets the analytics audit verify the expected tag IDs.</p>
       </div>
       {% endif %}
-      {% if not group['items'] %}
+      {% if not group['items'] and not group.requires_access %}
       <p class="empty-note">No audits available in this stream yet.</p>
       {% endif %}
     </fieldset>

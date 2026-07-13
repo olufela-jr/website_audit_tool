@@ -1,7 +1,7 @@
 # Website Audit Tool — GTM / GA4 Verifier
 
-Audits a site's Google Tag Manager / GA4 implementation. It drives a Chrome
-session, watches `window.dataLayer` and GA4 network traffic, validates required
+Audits a site's Google Tag Manager / GA4 implementation. It drives a Chromium
+session (via Playwright), watches `window.dataLayer` and GA4 network traffic, validates required
 fields on each event, and produces either a colour-coded terminal report or a
 client-ready PowerPoint deck.
 
@@ -43,15 +43,21 @@ process exits non-zero if any non-INFO check fails, so it can gate CI.
 
 ## Setup
 
-Requires Python 3.9+ and a local install of Google Chrome. Selenium 4.6+ ships
-with Selenium Manager, so chromedriver is downloaded automatically.
+Requires Python 3.9+. Playwright downloads its own bundled Chromium, so no
+system Chrome or chromedriver install is needed.
 
 ```bash
 cd website_audit_tool
 python3 -m venv venv
 source venv/bin/activate
 pip install -r gtm_verifier/requirements.txt
+python -m playwright install chromium
 ```
+
+To drive an installed Google Chrome instead of the bundled Chromium (e.g. when
+a site's bot protection treats them differently), set `BROWSER_CHANNEL=chrome`.
+How sites tell the two apart — and when each is the right choice — is written
+up in `notes/chromium-vs-chrome.txt`.
 
 ## Usage
 
