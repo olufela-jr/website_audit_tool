@@ -193,10 +193,13 @@ def _parse_collect(requests: List[dict]) -> List[dict]:
     for req in requests:
         try:
             url = req["url"]
-            if "/collect" not in url:
-                continue
             params = dict(parse_qsl(urlparse(url).query))
             if params.get("v") != "2":
+                continue
+            # Standard endpoints keep a /collect path; sGTM proxies often
+            # rewrite it (e.g. /metrics/ag/g/c) — for those, the v=2 + G- tid
+            # combination is the GA4 signature.
+            if "/collect" not in url and not str(params.get("tid", "")).startswith("G-"):
                 continue
             if req["post_data"]:
                 params.update(dict(parse_qsl(req["post_data"])))

@@ -117,6 +117,14 @@ def _analytics_checks(
     ga4_ids = sorted(set(_RE_GA4_ID.findall(corpus)))
     gtm_ids = sorted(set(_RE_GTM_ID.findall(corpus)))
 
+    # Collect requests carry the measurement ID as `tid` — often the only
+    # place it appears on sGTM sites that keep G- IDs out of page scripts.
+    collect_tids = {
+        r["params"]["tid"] for r in collect_requests
+        if str(r["params"].get("tid", "")).startswith("G-")
+    }
+    ga4_ids = sorted(set(ga4_ids) | collect_tids)
+
     # Live GTM container keys are most authoritative
     live_containers = [k for k in js.get("gtmKeys", []) if k.startswith("GTM-")]
     if live_containers:
@@ -141,8 +149,11 @@ def _analytics_checks(
         passed=bool(ga4_ids or collect_urls),
         detail=(
             f"Measurement IDs detected: {', '.join(ga4_ids)}"
-            if ga4_ids
-            else "No GA4 measurement ID found in scripts or network requests"
+            if ga4_ids else
+            "GA4 collect traffic observed, but no measurement ID visible "
+            "(server-side setup may strip it)"
+            if collect_urls else
+            "No GA4 measurement ID found in scripts or network requests"
         ),
     ))
 
