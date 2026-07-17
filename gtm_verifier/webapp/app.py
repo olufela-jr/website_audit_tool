@@ -26,12 +26,15 @@ Then open http://localhost:5000.
 
 import io
 import os
+import re
 import sys
 import tempfile
 import time
 import traceback
 import uuid
+from datetime import datetime
 from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
 import yaml
 from flask import Flask, abort, redirect, render_template, request, send_file, url_for
@@ -331,9 +334,19 @@ def download_report(run_id: str):
     return send_file(
         data,
         as_attachment=True,
-        download_name="gtm_audit.pptx",
+        download_name=_report_filename(run),
         mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
     )
+
+
+def _report_filename(run: dict) -> str:
+    """`<site>_<audit-date>.pptx` — e.g. tails.com_2026-07-17.pptx. The target
+    may also be 'GA4 property G-XXXX' (ID-only runs), which has no hostname."""
+    target = run["url"]
+    site = urlparse(target).hostname or target
+    site = re.sub(r"[^A-Za-z0-9.-]+", "_", site).strip("_.") or "audit"
+    stamp = datetime.fromtimestamp(run["created"]).strftime("%Y-%m-%d")
+    return f"{site}_{stamp}.pptx"
 
 
 if __name__ == "__main__":
