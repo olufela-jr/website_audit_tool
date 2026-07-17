@@ -78,6 +78,12 @@
            placeholder="https://example.com  (optional if a config with site.base_url is uploaded)"
            value="{{ url or '' }}" autofocus>
 
+    <label class="field" for="measurement_id" style="margin-top: .9rem;">GA4 Measurement ID
+      <span class="hint-inline">(optional)</span></label>
+    <input type="text" id="measurement_id" name="measurement_id"
+           placeholder="G-XXXXXXXXXX — inspect a property's admin settings directly; no URL needed"
+           value="{{ measurement_id or '' }}">
+
     {% for group in groups %}
     <fieldset class="{{ 'authorized' if group.requires_access else 'public' }}" data-stream="{{ group.id }}">
       <legend>{{ group.title }}</legend>

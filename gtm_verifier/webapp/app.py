@@ -49,6 +49,7 @@ import config  # noqa: E402
 import consent  # noqa: E402
 import journeys as journeys_mod  # noqa: E402
 import network  # noqa: E402
+import remote_config  # noqa: E402
 import seo  # noqa: E402
 import security_headers  # noqa: E402
 import tags_inventory  # noqa: E402
@@ -77,6 +78,7 @@ AUDIT_GROUPS = [
             ("analytics", "Analytics setup", analytics.run_analytics_audit),
             ("consent", "Consent & privacy", consent.run_consent_audit),
             ("network", "Network / collect", network.run_network_audit),
+            ("ga4_config", "GA4 property settings (remote config)", remote_config.run_remote_config_audit),
             ("tags", "Tag & pixel inventory", tags_inventory.run_tag_inventory_audit),
             ("seo", "SEO & metadata", seo.run_seo_audit),
             ("security", "Security headers", security_headers.run_security_headers_audit),
@@ -188,12 +190,26 @@ def run_audit():
     url = (request.form.get("url") or "").strip()
     if not url and site_config:
         url = ((site_config.get("site") or {}).get("base_url") or "").strip()
+    measurement_id = (request.form.get("measurement_id") or "").strip()
+
+    selected = [name for name in AUDITS if request.form.get(name)]
+    run_journeys = bool(request.form.get("journeys"))
+
     if not url:
-        return render_template(
-            "index.html", groups=AUDIT_GROUPS,
-            error="Please enter a URL (or upload a config with site.base_url).",
-        )
-    if not url.startswith(("http://", "https://")):
+        # A bare measurement ID can serve the ga4_config audit (pure HTTP);
+        # every other audit needs a page to load.
+        others = [n for n in selected if n != "ga4_config"] or (["journeys"] if run_journeys else [])
+        if not measurement_id or others:
+            return render_template(
+                "index.html", groups=AUDIT_GROUPS, measurement_id=measurement_id,
+                error=(
+                    "Please enter a URL (or upload a config with site.base_url)."
+                    if not measurement_id else
+                    "A URL is required for the other selected audits — with only a "
+                    "measurement ID, just 'GA4 property settings' can run."
+                ),
+            )
+    if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
 
     # Apply the uploaded config so the consent selector / timeouts take effect
@@ -201,11 +217,10 @@ def run_audit():
     # same behaviour as the CLI. (Global state: fine for a single local process.)
     if site_config is not None:
         config.load_dict(site_config, path=upload.filename)
-    config.set_base_url(url)
+    if url:
+        config.set_base_url(url)
     site_journeys = (site_config or {}).get("journeys") or {}
 
-    selected = [name for name in AUDITS if request.form.get(name)]
-    run_journeys = bool(request.form.get("journeys"))
     if not selected and not run_journeys:
         return render_template(
             "index.html", groups=AUDIT_GROUPS, error="Pick at least one audit to run.", url=url
@@ -218,7 +233,8 @@ def run_audit():
     # lives entirely on this request thread — Playwright's sync API is
     # thread-affine, so it must never be shared across requests.
     journey_results: List[Tuple[str, List[CheckResult]]] = []
-    with browser.browser_session():
+
+    def _run_selected():
         for name in selected:
             label, fn = AUDITS[name]
             # Authorized-stream audits only run when the operator confirms access.
@@ -232,7 +248,15 @@ def run_audit():
                 journey_results.append((name, checks))
                 continue
             try:
-                if name == "analytics" and site_config is not None:
+                if name == "ga4_config":
+                    # Form-supplied measurement ID wins; the uploaded config's
+                    # expected ga4_id seeds the lookup; else IDs come from the page.
+                    checks = remote_config.run_remote_config_audit(
+                        url or None,
+                        measurement_id=measurement_id or config.GA4_ID,
+                        expected=config.ga4_expectations(),
+                    )
+                elif name == "analytics" and site_config is not None:
                     # Verify the uploaded config's expected tag IDs against the site
                     checks = analytics.run_analytics_audit(
                         url, expected_gtm_id=config.GTM_ID, expected_ga4_id=config.GA4_ID
@@ -244,36 +268,48 @@ def run_audit():
                 checks = [failed_check(name, f"Audit crashed: {exc}\n{tb}")]
             journey_results.append((name, checks))
 
-        # dataLayer journeys from the uploaded config (Authorized stream)
-        if run_journeys:
-            if not authorized:
-                journey_results.append(("journeys", [skip_check(
-                    "Journey verification",
-                    "Not assessed — access required: confirm authorized access to run journeys.",
-                    Severity.HIGH,
-                )]))
-            elif not site_journeys:
-                journey_results.append(("journeys", [skip_check(
-                    "Journey verification",
-                    "No config uploaded (or it has no 'journeys:' section) — "
-                    "upload a site config YAML to run dataLayer journeys.",
-                    Severity.HIGH,
-                )]))
-            else:
-                for jname, spec in site_journeys.items():
-                    try:
-                        checks = journeys_mod.run_journey(jname, spec)
-                    except Exception as exc:
-                        tb = traceback.format_exc()
-                        checks = [failed_check(jname, f"Journey crashed: {exc}\n{tb}")]
-                    journey_results.append((jname, checks))
+    if url:
+        with browser.browser_session():
+            _run_selected()
+            _run_config_journeys(journey_results, run_journeys, authorized, site_journeys)
+    else:
+        # ID-only run: ga4_config is pure HTTP — no browser needed.
+        _run_selected()
 
     _prune_cache()
     run_id = uuid.uuid4().hex
-    _RUNS[run_id] = {"url": url, "results": journey_results, "created": time.time()}
+    target = url or f"GA4 property {measurement_id}"
+    _RUNS[run_id] = {"url": target, "results": journey_results, "created": time.time()}
 
     view = _build_view(journey_results)
-    return render_template("results.html", url=url, run_id=run_id, **view)
+    return render_template("results.html", url=target, run_id=run_id, **view)
+
+
+def _run_config_journeys(journey_results, run_journeys, authorized, site_journeys):
+    """dataLayer journeys from the uploaded config (Authorized stream)."""
+    if not run_journeys:
+        return
+    if not authorized:
+        journey_results.append(("journeys", [skip_check(
+            "Journey verification",
+            "Not assessed — access required: confirm authorized access to run journeys.",
+            Severity.HIGH,
+        )]))
+    elif not site_journeys:
+        journey_results.append(("journeys", [skip_check(
+            "Journey verification",
+            "No config uploaded (or it has no 'journeys:' section) — "
+            "upload a site config YAML to run dataLayer journeys.",
+            Severity.HIGH,
+        )]))
+    else:
+        for jname, spec in site_journeys.items():
+            try:
+                checks = journeys_mod.run_journey(jname, spec)
+            except Exception as exc:
+                tb = traceback.format_exc()
+                checks = [failed_check(jname, f"Journey crashed: {exc}\n{tb}")]
+            journey_results.append((jname, checks))
 
 
 @app.route("/audit/<run_id>/report.pptx")

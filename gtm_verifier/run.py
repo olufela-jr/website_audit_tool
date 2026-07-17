@@ -33,6 +33,7 @@ SITE_AUDITS: Dict[str, Tuple[Callable, str]] = {
     "analytics_audit":  (journeys.journey_analytics_audit,  "GA4/GTM presence, deployment method, sGTM signals"),
     "consent_audit":    (journeys.journey_consent_audit,    "CMP banner, Consent Mode v2, pre/post-consent firing"),
     "network_audit":    (journeys.journey_network_audit,    "GA4 collect traffic — cid/sid, consent state, event inventory"),
+    "ga4_config":       (journeys.journey_ga4_config,       "GA4 property settings from public gtag.js — enhanced measurement, key events, signals"),
     "tag_inventory":    (journeys.journey_tag_inventory,    "All marketing/analytics tags and pixels on the page"),
     "seo":              (journeys.journey_seo,              "SEO & metadata checks"),
     "security_headers": (journeys.journey_security_headers, "HTTP security header checks"),
@@ -99,6 +100,12 @@ def main() -> None:
         help="Path to a YAML config file (default: config.yaml in this directory).",
     )
     parser.add_argument(
+        "--measurement-id", "-m",
+        metavar="G-XXXXXXXXXX",
+        help="GA4 measurement ID for the ga4_config audit. With no --url, runs "
+             "just that audit against the ID — pure HTTP, no browser needed.",
+    )
+    parser.add_argument(
         "--export", "-e",
         metavar="FILE.pptx",
         help="Export results to PowerPoint file instead of terminal output.",
@@ -129,6 +136,8 @@ def main() -> None:
 
     if args.url:
         config.set_base_url(args.url)
+    if args.measurement_id:
+        config.MEASUREMENT_ID = args.measurement_id
 
     available = _available()
 
@@ -136,16 +145,24 @@ def main() -> None:
         _print_list()
         sys.exit(0)
 
-    if not config.BASE_URL:
+    if not config.BASE_URL and not config.MEASUREMENT_ID:
         print(
             "No target site. Pass --url <site>, or provide a config file with site.base_url\n"
-            "(copy config.example.yaml to config.yaml, or use --config <file>).",
+            "(copy config.example.yaml to config.yaml, or use --config <file>).\n"
+            "To inspect a GA4 property directly, pass --measurement-id G-XXXXXXXXXX.",
             file=sys.stderr,
         )
         sys.exit(1)
 
+    # An explicit --measurement-id with no --url is an ID-only invocation: just
+    # the remote-config lookup, even when an auto-loaded config.yaml supplies a
+    # base_url (running the whole browser suite would be a surprise).
+    id_only = bool(args.measurement_id) and not args.url and not args.audits
+
     if args.audits:
         requested = args.audits
+    elif id_only or not config.BASE_URL:
+        requested = ["ga4_config"]
     elif args.url and not args.config:
         # Foreign-site mode: an ad-hoc URL with no explicit config gets only the
         # site-agnostic audits — configured journeys belong to a different site.
@@ -153,10 +170,18 @@ def main() -> None:
     else:
         requested = list(SITE_AUDITS) + list(config.JOURNEYS)
 
-    print(f"Target: {config.BASE_URL}")
-    # One shared browser process for the whole run; each audit still gets a
-    # fresh isolated context (see browser.audit_page).
-    with browser.browser_session():
+    if id_only or not config.BASE_URL:
+        target = f"GA4 property {config.MEASUREMENT_ID}"
+    else:
+        target = config.BASE_URL
+    print(f"Target: {target}")
+    if config.BASE_URL and not id_only:
+        # One shared browser process for the whole run; each audit still gets a
+        # fresh isolated context (see browser.audit_page).
+        with browser.browser_session():
+            journey_results = _run(requested, available)
+    else:
+        # ga4_config against a bare measurement ID is pure HTTP — no browser.
         journey_results = _run(requested, available)
     if not journey_results:
         print("No audits were run.", file=sys.stderr)
@@ -164,7 +189,7 @@ def main() -> None:
 
     if args.export:
         try:
-            export_to_powerpoint(journey_results, config.BASE_URL, args.export)
+            export_to_powerpoint(journey_results, target, args.export)
             sys.exit(0)
         except Exception as exc:
             print(f"Failed to export to PowerPoint: {exc}", file=sys.stderr)

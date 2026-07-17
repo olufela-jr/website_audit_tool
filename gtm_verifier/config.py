@@ -36,6 +36,31 @@ CONSENT_ACCEPT_BUTTON: Optional[str] = None  # site-specific CMP accept selector
 
 JOURNEYS: dict = {}                  # journey name -> spec; see journeys.py for the step schema
 
+MEASUREMENT_ID: Optional[str] = None # --measurement-id / web form — audit a property directly, no URL needed
+
+# Expected GA4 property (admin) settings, verified via the public gtag.js
+# remote config by the ga4_config audit. All optional; when set, mismatches
+# FAIL instead of just being reported.
+EXPECTED_KEY_EVENTS: list = []
+EXPECTED_CROSS_DOMAINS: list = []
+EXPECTED_ENHANCED_MEASUREMENT: dict = {}
+EXPECTED_GOOGLE_SIGNALS: Optional[str] = None
+
+
+def ga4_expectations() -> dict:
+    """Bundle the ga4_config expectations for remote_config's audit; empty
+    dict (falsy) when the config declares none."""
+    out = {}
+    if EXPECTED_KEY_EVENTS:
+        out["key_events"] = EXPECTED_KEY_EVENTS
+    if EXPECTED_CROSS_DOMAINS:
+        out["cross_domains"] = EXPECTED_CROSS_DOMAINS
+    if EXPECTED_ENHANCED_MEASUREMENT:
+        out["enhanced_measurement"] = EXPECTED_ENHANCED_MEASUREMENT
+    if EXPECTED_GOOGLE_SIGNALS:
+        out["google_signals"] = EXPECTED_GOOGLE_SIGNALS
+    return out
+
 
 def _real_id(value: Optional[str]) -> Optional[str]:
     """Filter template placeholders (GTM-XXXXXXX / G-XXXXXXXXXX) left in a config."""
@@ -57,11 +82,14 @@ def load_dict(c: dict, path: Optional[str] = None) -> None:
     can carry their own notes."""
     global CONFIG_PATH, BASE_URL, GTM_ID, GA4_ID
     global DEFAULT_TIMEOUT, EVENT_POLL_TIMEOUT, CONSENT_ACCEPT_BUTTON, JOURNEYS
+    global EXPECTED_KEY_EVENTS, EXPECTED_CROSS_DOMAINS
+    global EXPECTED_ENHANCED_MEASUREMENT, EXPECTED_GOOGLE_SIGNALS
 
     site = c.get("site") or {}
     tags = c.get("tags") or {}
     timeouts = c.get("timeouts") or {}
     selectors = c.get("selectors") or {}
+    ga4_cfg = c.get("ga4_config") or {}
 
     CONFIG_PATH = path
     base = site.get("base_url")
@@ -72,6 +100,10 @@ def load_dict(c: dict, path: Optional[str] = None) -> None:
     EVENT_POLL_TIMEOUT = timeouts.get("event_poll") or EVENT_POLL_TIMEOUT
     CONSENT_ACCEPT_BUTTON = (selectors.get("consent") or {}).get("accept_button")
     JOURNEYS = c.get("journeys") or {}
+    EXPECTED_KEY_EVENTS = ga4_cfg.get("expected_key_events") or []
+    EXPECTED_CROSS_DOMAINS = ga4_cfg.get("expected_cross_domains") or []
+    EXPECTED_ENHANCED_MEASUREMENT = ga4_cfg.get("expected_enhanced_measurement") or {}
+    EXPECTED_GOOGLE_SIGNALS = ga4_cfg.get("expected_google_signals")
 
 
 def set_base_url(url: str) -> None:

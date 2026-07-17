@@ -18,6 +18,11 @@ from core import (
     skip_check,
 )
 
+# What the most recent network audit observed, for cross-referencing by other
+# audits in the same run (remote_config compares declared key events against
+# these). Keyed by URL so a stale run for a different site is never matched.
+LAST_RUN: dict = {}
+
 
 def run_network_audit(url: str) -> List[CheckResult]:
     """
@@ -41,6 +46,13 @@ def _network_checks(page, recorder, url: str) -> List[CheckResult]:
     accept_consent(page)
 
     requests = recorder.drain_collect(timeout=10.0)
+
+    global LAST_RUN
+    LAST_RUN = {
+        "url": url,
+        "event_names": sorted({r["params"]["en"] for r in requests if "en" in r["params"]}),
+        "params": [r["params"] for r in requests],
+    }
 
     # ── Check 1: GA4 collect requests present ─────────────────────────
     if not requests:
@@ -122,7 +134,7 @@ def _network_checks(page, recorder, url: str) -> List[CheckResult]:
         ))
 
     # ── Check 5: Event inventory (INFO) ───────────────────────────────
-    event_names = sorted({r["params"]["en"] for r in requests if "en" in r["params"]})
+    event_names = LAST_RUN["event_names"]
     results.append(CheckResult(
         name="Event inventory",
         event=None,

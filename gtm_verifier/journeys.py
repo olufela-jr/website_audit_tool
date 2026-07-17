@@ -46,6 +46,7 @@ from browser import audit_page
 from analytics import run_analytics_audit
 from consent import run_consent_audit
 from network import run_network_audit
+from remote_config import run_remote_config_audit
 from seo import run_seo_audit
 from security_headers import run_security_headers_audit
 from tags_inventory import run_tag_inventory_audit
@@ -252,6 +253,16 @@ def journey_consent_audit() -> List[CheckResult]:
 
 def journey_network_audit() -> List[CheckResult]:
     return run_network_audit(config.BASE_URL)
+
+
+def journey_ga4_config() -> List[CheckResult]:
+    # Explicit --measurement-id wins; the client YAML's expected ga4_id seeds
+    # the lookup otherwise; with neither, IDs are discovered from the page.
+    return run_remote_config_audit(
+        config.BASE_URL,
+        measurement_id=config.MEASUREMENT_ID or config.GA4_ID,
+        expected=config.ga4_expectations(),
+    )
 
 
 def journey_tag_inventory() -> List[CheckResult]:

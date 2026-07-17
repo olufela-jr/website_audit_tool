@@ -27,6 +27,15 @@ timeouts:
   default: 10       # seconds — element wait for DOM interactions
   event_poll: 15    # seconds — dataLayer event polling
 
+# Expected GA4 property (admin) settings — verified by the ga4_config audit via
+# the public gtag.js remote config, no GA account access needed. All optional;
+# when set, a mismatch FAILs instead of just being reported as an observation.
+# ga4_config:
+#   expected_key_events: [purchase, generate_lead]
+#   expected_cross_domains: [shop.example.com]      # hosts the linker must cover
+#   expected_enhanced_measurement: {page_view: true, scroll: true, form: false}
+#   expected_google_signals: ENABLED                # or DISABLED
+
 selectors:
   consent:
     # Site-specific CMP "accept all" button. Optional — common CMPs (OneTrust,
