@@ -284,6 +284,7 @@ _CONSENT_SELECTORS = [
     ".qc-cmp2-summary-buttons button[mode='primary']",         # Quantcast
     "#didomi-notice-agree-button",                             # Didomi
     "button.fc-cta-consent",                                   # Google Funding Choices
+    ".iubenda-cs-accept-btn",                                  # Iubenda
     "[aria-label='Accept all']", "[aria-label='Allow all']",
 ]
 # Visible button/link text (lower-cased) signalling an accept-all control.

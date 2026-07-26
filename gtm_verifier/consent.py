@@ -47,6 +47,8 @@ _CMP_SELECTORS = [
     ("#truste-consent-content",       "TrustArc"),
     (".truste_overlay",               "TrustArc"),
     (".qc-cmp2-container",            "Quantcast"),
+    ("#iubenda-cs-banner",             "Iubenda"),
+    (".iubenda-cs-container",          "Iubenda"),
     ("#didomi-popup",                 "Didomi"),
     (".didomi-popup-container",       "Didomi"),
     ("#cookie-script-notice",         "Cookie Script"),
