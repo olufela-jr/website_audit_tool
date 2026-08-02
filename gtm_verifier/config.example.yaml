@@ -27,6 +27,15 @@ timeouts:
   default: 10       # seconds — element wait for DOM interactions
   event_poll: 15    # seconds — dataLayer event polling
 
+# CMP detection tuning (consent.py's tiered detect_cmp). Unvalidated
+# placeholders — override here once real-site runs suggest better values.
+# cmp_detection:
+#   timeout: 8            # seconds to poll for an asynchronously-injected CMP
+#   poll_ms: 300
+#   tier1_confidence: 0.95  # TCF/GPP standards API, or gtag consent command
+#   tier2_confidence: 0.6   # known CMP CDN request host
+#   tier3_confidence: 0.35  # curated DOM selector (tail-catcher)
+
 # Expected GA4 property (admin) settings — verified by the ga4_config audit via
 # the public gtag.js remote config, no GA account access needed. All optional;
 # when set, a mismatch FAILs instead of just being reported as an observation.

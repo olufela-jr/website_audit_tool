@@ -5,7 +5,11 @@ directly with hand-built collect-request dicts."""
 import pytest
 
 from consent import (
+    _CMP_CDN_HOSTS,
+    _TCF_CMP_ID_TO_NAME,
     _extract_consent_default,
+    _has_gtag_consent_command,
+    _match_cdn_host,
     _post_consent_transition_result,
     _pre_consent_firing_result,
 )
@@ -171,3 +175,72 @@ def test_transition_absent_gcs_post_consent_fails():
     result = _post_consent_transition_result([], post, consent_update_found=False)
     assert result.passed is False
     assert "absent" in result.detail
+
+
+# ── tiered CMP detection: pure helpers (Tier 1 / Tier 2) ────────────────────
+
+def test_has_gtag_consent_command_detects_default():
+    dl = [{"event": "page_view"}, ["consent", "default", {"analytics_storage": "denied"}]]
+    assert _has_gtag_consent_command(dl) is True
+
+
+def test_has_gtag_consent_command_detects_update():
+    # 'update' must count too — _extract_consent_default deliberately ignores
+    # it (it's not the default state), but detect_cmp only needs to know a
+    # Consent Mode command exists at all.
+    dl = [{"0": "consent", "1": "update", "2": {"analytics_storage": "granted"}}]
+    assert _has_gtag_consent_command(dl) is True
+
+
+def test_has_gtag_consent_command_ignores_plain_pushes():
+    dl = [{"event": "page_view"}, {"ecommerce": {"value": 9.99}}]
+    assert _has_gtag_consent_command(dl) is False
+
+
+def test_has_gtag_consent_command_empty_or_none():
+    assert _has_gtag_consent_command([]) is False
+    assert _has_gtag_consent_command(None) is False
+
+
+def test_tcf_cmp_id_to_name_known_vendors():
+    # Spot-check against Google's certified-CMP list (see the comment in
+    # consent.py for the source URL) — a wrong id here silently misattributes
+    # a vendor, so pin the values we rely on.
+    assert _TCF_CMP_ID_TO_NAME[123] == "Iubenda"
+    assert _TCF_CMP_ID_TO_NAME[28] == "OneTrust"
+    assert _TCF_CMP_ID_TO_NAME[7] == "Didomi"
+    assert _TCF_CMP_ID_TO_NAME[5] == "Usercentrics"
+    assert _TCF_CMP_ID_TO_NAME[134] == "Cookiebot"
+
+
+def test_tcf_cmp_id_to_name_unknown_id_degrades_gracefully():
+    # An unmapped cmpId must not raise or be silently treated as "no CMP" —
+    # the caller reports "present, unnamed", never a false negative.
+    assert _TCF_CMP_ID_TO_NAME.get(999999) is None
+
+
+def test_match_cdn_host_exact_match():
+    match = _match_cdn_host({"cs.iubenda.com"})
+    assert match == ("cs.iubenda.com", "Iubenda")
+
+
+def test_match_cdn_host_subdomain_match():
+    # A vendor may serve from a subdomain of the known host.
+    match = _match_cdn_host({"eu.cdn.cookielaw.org"})
+    assert match == ("cdn.cookielaw.org", "OneTrust")
+
+
+def test_match_cdn_host_no_match():
+    assert _match_cdn_host({"example.com", "fonts.googleapis.com"}) is None
+
+
+def test_match_cdn_host_does_not_match_lookalike_domain():
+    # "cs.iubenda.com.evil.com" must not match "cs.iubenda.com" — endswith on
+    # the bare label, not a raw substring test.
+    assert _match_cdn_host({"cs.iubenda.com.evil.com"}) is None
+
+
+def test_cmp_cdn_hosts_are_lowercase():
+    # _tier2_cdn_hosts lowercases seen hostnames before matching; the lookup
+    # table must already be lowercase or matches would silently never fire.
+    assert all(host == host.lower() for host in _CMP_CDN_HOSTS)

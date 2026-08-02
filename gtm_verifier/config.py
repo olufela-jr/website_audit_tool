@@ -34,6 +34,15 @@ EVENT_POLL_TIMEOUT = 15              # seconds — dataLayer event polling
 
 CONSENT_ACCEPT_BUTTON: Optional[str] = None  # site-specific CMP accept selector (common CMPs are auto-detected)
 
+# CMP detection tuning (gtm_verifier/consent.py's tiered detect_cmp). The
+# confidence weights and poll timing are placeholders — not yet validated
+# against a real sample of sites; tune here as evidence comes in.
+CMP_DETECTION_TIMEOUT = 8.0     # seconds to poll for an asynchronously-injected CMP
+CMP_DETECTION_POLL_MS = 300
+CMP_TIER1_CONFIDENCE = 0.95     # TCF/GPP standards API, or gtag consent command
+CMP_TIER2_CONFIDENCE = 0.6      # known CMP CDN request host
+CMP_TIER3_CONFIDENCE = 0.35     # curated DOM selector (tail-catcher)
+
 JOURNEYS: dict = {}                  # journey name -> spec; see journeys.py for the step schema
 
 MEASUREMENT_ID: Optional[str] = None # --measurement-id / web form — audit a property directly, no URL needed
@@ -84,12 +93,15 @@ def load_dict(c: dict, path: Optional[str] = None) -> None:
     global DEFAULT_TIMEOUT, EVENT_POLL_TIMEOUT, CONSENT_ACCEPT_BUTTON, JOURNEYS
     global EXPECTED_KEY_EVENTS, EXPECTED_CROSS_DOMAINS
     global EXPECTED_ENHANCED_MEASUREMENT, EXPECTED_GOOGLE_SIGNALS
+    global CMP_DETECTION_TIMEOUT, CMP_DETECTION_POLL_MS
+    global CMP_TIER1_CONFIDENCE, CMP_TIER2_CONFIDENCE, CMP_TIER3_CONFIDENCE
 
     site = c.get("site") or {}
     tags = c.get("tags") or {}
     timeouts = c.get("timeouts") or {}
     selectors = c.get("selectors") or {}
     ga4_cfg = c.get("ga4_config") or {}
+    cmp_cfg = c.get("cmp_detection") or {}
 
     CONFIG_PATH = path
     base = site.get("base_url")
@@ -104,6 +116,11 @@ def load_dict(c: dict, path: Optional[str] = None) -> None:
     EXPECTED_CROSS_DOMAINS = ga4_cfg.get("expected_cross_domains") or []
     EXPECTED_ENHANCED_MEASUREMENT = ga4_cfg.get("expected_enhanced_measurement") or {}
     EXPECTED_GOOGLE_SIGNALS = ga4_cfg.get("expected_google_signals")
+    CMP_DETECTION_TIMEOUT = cmp_cfg.get("timeout") or CMP_DETECTION_TIMEOUT
+    CMP_DETECTION_POLL_MS = cmp_cfg.get("poll_ms") or CMP_DETECTION_POLL_MS
+    CMP_TIER1_CONFIDENCE = cmp_cfg.get("tier1_confidence") or CMP_TIER1_CONFIDENCE
+    CMP_TIER2_CONFIDENCE = cmp_cfg.get("tier2_confidence") or CMP_TIER2_CONFIDENCE
+    CMP_TIER3_CONFIDENCE = cmp_cfg.get("tier3_confidence") or CMP_TIER3_CONFIDENCE
 
 
 def set_base_url(url: str) -> None:
