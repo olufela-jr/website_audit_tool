@@ -3,7 +3,7 @@ HOW TO RUN AUDITS LOCALLY
 
 SETUP (first time only)
 ------------------------
-cd /Users/fela.sanu/Documents/code/website_audit_tool
+cd ~/Documents/assembly_code/website_audit_tool
 source venv/bin/activate
 cd gtm_verifier
 
@@ -52,6 +52,82 @@ WEB FRONT END
 flask --app webapp.app run          (from gtm_verifier/, HEADLESS=1 optional)
 Open http://localhost:5000. Enter a URL for the public/authorized audits;
 upload a client config YAML to also run its journeys and verify tag IDs.
+
+
+DEPLOYED WEB APP (Cloud Run)
+----------------------------
+The web front end also runs in GCP, so the team can audit without a local venv:
+project project-atlas-audit, region europe-west2, service gtm-verifier.
+It sits behind IAP — sign in with a Google account that has been granted
+roles/iap.httpsResourceAccessor.
+
+Ship a new revision (Cloud Build builds the Dockerfile; no local Docker needed):
+  ./deploy.sh
+
+Tail logs:
+  gcloud run services logs read gtm-verifier \
+      --project project-atlas-audit --region europe-west2
+
+FIRST-TIME GCP SETUP (once per machine)
+  gcloud auth login fela@cloud-runner.co.uk
+  gcloud config set account fela@cloud-runner.co.uk
+  gcloud config set project project-atlas-audit
+  gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+                         artifactregistry.googleapis.com iap.googleapis.com
+
+FIRST-TIME IAP SETUP (already done for this project)
+  Cloud Run's integrated IAP supplies its own Google-managed OAuth client, so
+  there is NO OAuth consent screen to configure in the console — enabling it is
+  the whole step:
+     gcloud beta run services update gtm-verifier \
+         --project project-atlas-audit --region europe-west2 --iap
+  It also needs cloudresourcemanager.googleapis.com enabled for the IAM calls
+  below to work.
+
+ADDING A USER
+     ./iap_access.sh add someone@example.com [more@example.com ...]
+     ./iap_access.sh list
+     ./iap_access.sh remove someone@example.com
+
+  Access is an explicit per-user allowlist, and it is IAM — signing in with
+  Google is not enough, the account also needs the binding. Any domain works;
+  the org has no domain-restricted-sharing policy. Changes take up to a minute,
+  and an already-signed-in user may need a hard reload to clear the old verdict.
+
+  Once the list grows past a handful, make a Google Group and bind it once
+  instead of maintaining individual bindings:
+     ./iap_access.sh add group:audit-team@cloud-runner.co.uk
+
+  Anyone with access can drive a real browser at any URL from inside GCP —
+  see notes/cloud-followups.md #4 before widening the list.
+
+TWO PERMISSIONS, TWO LAYERS
+  browser user --[iap.httpsResourceAccessor]--> IAP --[run.invoker]--> service
+
+  iap_access.sh     roles/iap.httpsResourceAccessor, on the IAP resource.
+                    What a PERSON needs. This is the one you will use.
+  invoker_access.sh roles/run.invoker, on the Cloud Run service. Held by IAP's
+                    own service agent so IAP can call the app on a user's
+                    behalf. Granted automatically; people do not need it.
+
+  The two are separate resources, which is why the commands differ — see the
+  header of each script.
+
+PROGRAMMATIC ACCESS
+  Not currently set up. With IAP enabled, a plain Cloud Run identity token
+  (`gcloud auth print-identity-token`) is rejected with 401, and
+  `gcloud run services proxy` no longer reaches the app either — IAP intercepts
+  both. A script or CI job would need an OIDC token minted for IAP's OAuth
+  client ID as its audience, plus its service account on the iap_access.sh
+  allowlist.
+
+Test the container locally before deploying (Cloud Run injects PORT):
+  docker build -t gtm-verifier .
+  docker run --rm -e PORT=8080 -p 8080:8080 gtm-verifier   # http://localhost:8080
+
+The deployed service is deliberately single-tenant per instance and keeps
+results in process memory. Read notes/cloud-followups.md before changing any
+flag in deploy.sh — several of them stand in for unfixed bugs.
 
 
 NOTES

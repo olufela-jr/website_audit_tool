@@ -7,8 +7,14 @@ playwright==1.60.0
 PyYAML>=6.0
 python-pptx>=0.6.23
 
-# Local web front end (webapp/)
+# seo.py parses HTML with lxml. It also arrives transitively via python-pptx,
+# but webapp/app.py imports seo at module scope — so if python-pptx ever drops
+# the dependency it breaks app startup, not just one audit. Pin it directly.
+lxml>=5.0
+
+# Web front end (webapp/): Flask app, served by gunicorn in the container.
 Flask>=3.0
+gunicorn>=21.2
 
 # Dev / tests
 pytest>=7.0

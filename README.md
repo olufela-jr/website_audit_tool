@@ -8,7 +8,7 @@ client-ready PowerPoint deck.
 Works in **two modes**:
 
 - **Foreign site** — point it at any public URL, no configuration at all. Runs
-  the six infrastructure audits (useful for prospect audits / first contact).
+  the seven infrastructure audits (useful for prospect audits / first contact).
 - **Client site** — a per-client YAML config adds expected GTM/GA4 IDs to
   verify and declarative **journeys** that walk the site and assert the
   dataLayer events their tagging is supposed to push. Onboarding a new client
@@ -23,6 +23,7 @@ Works in **two modes**:
 | `analytics_audit` | `analytics.py` | GA4/GTM presence and deployment method; verifies expected IDs when configured |
 | `consent_audit`   | `consent.py`   | CMP banner, Consent Mode v2 signals, pre-/post-consent GA4 firing |
 | `network_audit`   | `network.py`   | GA4 `collect` requests via CDP — client ID, session ID, consent state, event inventory |
+| `ga4_config`      | `remote_config.py` | GA4 property settings read from the public `gtag.js` remote config — key events, cross-domain list, enhanced measurement, Google signals |
 | `tag_inventory`   | `tags_inventory.py` | All marketing/analytics tags and pixels on the page |
 | `seo`             | `seo.py`       | SEO & metadata checks |
 | `security_headers`| `security_headers.py` | HTTP security header checks |
@@ -57,7 +58,8 @@ python -m playwright install chromium
 To drive an installed Google Chrome instead of the bundled Chromium (e.g. when
 a site's bot protection treats them differently), set `BROWSER_CHANNEL=chrome`.
 How sites tell the two apart — and when each is the right choice — is written
-up in `notes/chromium-vs-chrome.txt`.
+up in `chromium-vs-chrome.txt`. (Not available in the deployed container, which
+only ships bundled Chromium.)
 
 ## Usage
 
@@ -105,6 +107,19 @@ upload a client config YAML to also run its journeys and verify expected tag
 IDs — same no-code onboarding as the CLI. Results render as HTML with a
 PowerPoint download.
 
+## Deployment
+
+The web front end runs on Cloud Run (project `project-atlas-audit`, region
+`europe-west2`), behind IAP — access needs a Google account granted
+`roles/iap.httpsResourceAccessor`. Ship a revision with `./deploy.sh`; Cloud
+Build builds the `Dockerfile`, so no local Docker is required. Setup steps and
+log commands are in `HOWTORUN.txt`.
+
+The service is configured as single-tenant per instance (`--concurrency 1`) and
+holds results in process memory. Several `deploy.sh` flags stand in for bugs
+that are still open in the code — read `notes/cloud-followups.md` before
+changing any of them.
+
 ## Project layout
 
 ```
@@ -119,9 +134,13 @@ gtm_verifier/
   analytics.py          analytics_audit
   consent.py            consent_audit
   network.py            network_audit (CDP traffic capture)
+  remote_config.py      ga4_config (GA4 property settings from public gtag.js)
   tags_inventory.py     tag_inventory
   seo.py                seo
   security_headers.py   security_headers
   export.py             PowerPoint export
   webapp/               Flask front end (URL + optional config upload)
+Dockerfile              container image (Playwright base + gunicorn)
+deploy.sh               deploy the web front end to Cloud Run
+notes/cloud-followups.md  what the Cloud Run flags are standing in for
 ```

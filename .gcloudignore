@@ -1,0 +1,41 @@
+# What `gcloud run deploy --source` uploads to Cloud Build.
+#
+# Creating this file DISABLES gcloud's fallback of reading .gitignore, so
+# everything that matters has to be restated here — including the venv and the
+# git-ignored client config.
+#
+# .dockerignore still applies during the `docker build` inside Cloud Build; this
+# file is the earlier gate, keeping client data out of the build context
+# entirely rather than just out of the image.
+
+.git/
+.gitignore
+venv/
+.venv/
+env/
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Deployment notes and generated decks are not part of the app.
+notes/
+*.pptx
+*.ppt
+*.log
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# Tests aren't run in the image and pull in large captured gtag.js fixtures.
+gtm_verifier/tests/
+
+# Client configs never leave the laptop. config.py auto-loads config.yaml on
+# import, so a stray copy would point a fresh deployment at a real client site;
+# palm_view_config.yaml is committed and carries a live client URL and tag IDs.
+# See notes/cloud-followups.md #5.
+gtm_verifier/config.yaml
+gtm_verifier/palm_view_config.yaml
+*.local.yaml

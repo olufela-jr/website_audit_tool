@@ -68,7 +68,7 @@
 </head>
 <body>
   <h1>GTM / GA4 Verifier</h1>
-  <p class="sub">Audit a site's analytics setup. A Chrome window will open while it runs.</p>
+  <p class="sub">Audit a site's analytics setup. Each audit drives a real browser against the site, so a run takes a couple of minutes.</p>
 
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -131,7 +131,7 @@
     <div class="spinner"></div>
     <h2>Running audit&hellip;</h2>
     <div class="running-list" id="running-list"></div>
-    <p class="hint">This can take up to a minute. Browser audits will open a Chrome window &mdash; please leave it alone until the results appear.</p>
+    <p class="hint">This usually takes 1&ndash;2 minutes, longer with journeys. Keep this tab open &mdash; the results appear here when the run finishes.</p>
   </div>
 
   <script>
