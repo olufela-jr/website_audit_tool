@@ -34,9 +34,12 @@ RUN_ARGS=(--project "$PROJECT_ID" --region "$REGION")
 usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 current_list() {
+  # gcloud's extract() renders the value wrapped in [' '], so strip brackets
+  # AND quotes — otherwise the first and last entries carry a stray ' and the
+  # list looks corrupted even though the stored value is clean.
   gcloud run services describe "$SERVICE" "${RUN_ARGS[@]}" \
     --format='value(spec.template.spec.containers[0].env.filter("name:ALLOWED_USERS").extract("value"))' \
-    2>/dev/null | tr -d '[]' | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d'
+    2>/dev/null | tr -d "[]'\"" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d'
 }
 
 apply_list() {
