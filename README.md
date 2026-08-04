@@ -110,10 +110,15 @@ PowerPoint download.
 ## Deployment
 
 The web front end runs on Cloud Run (project `project-atlas-audit`, region
-`europe-west2`), behind IAP — access needs a Google account granted
-`roles/iap.httpsResourceAccessor`. Ship a revision with `./deploy.sh`; Cloud
-Build builds the `Dockerfile`, so no local Docker is required. Setup steps and
-log commands are in `HOWTORUN.txt`.
+`europe-west2`). Access is Google sign-in plus an email allowlist, handled in
+the app (`webapp/auth.py`) — manage it with `./users.sh add someone@example.com`.
+Ship a revision with `./deploy.sh`; Cloud Build builds the `Dockerfile`, so no
+local Docker is required. Setup steps and log commands are in `HOWTORUN.txt`.
+
+Audit targets are restricted to public internet hosts: `net_guard.py` resolves
+each URL and refuses private, loopback and link-local addresses (the cloud
+metadata endpoint in particular). `ALLOW_PRIVATE_TARGETS=1` lifts that for
+local staging work.
 
 The service is configured as single-tenant per instance (`--concurrency 1`) and
 holds results in process memory. Several `deploy.sh` flags stand in for bugs
@@ -126,6 +131,7 @@ changing any of them.
 gtm_verifier/
   run.py                CLI entry point and audit dispatch
   config.py             tolerant YAML config loader (every key optional)
+  net_guard.py          SSRF guard — public-internet targets only
   config.example.yaml   client config template with the journey schema
   palm_view_config.yaml verified worked example (Palm View demo site)
   core.py               driver, persistent dataLayer recorder, polling,
@@ -140,7 +146,9 @@ gtm_verifier/
   security_headers.py   security_headers
   export.py             PowerPoint export
   webapp/               Flask front end (URL + optional config upload)
+    auth.py             Google sign-in + ALLOWED_USERS allowlist
 Dockerfile              container image (Playwright base + gunicorn)
 deploy.sh               deploy the web front end to Cloud Run
+users.sh                add/remove who can sign in
 notes/cloud-followups.md  what the Cloud Run flags are standing in for
 ```

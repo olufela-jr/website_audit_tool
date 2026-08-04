@@ -18,6 +18,19 @@ PROJECT_ID="${PROJECT_ID:-project-atlas-audit}"
 REGION="${REGION:-europe-west2}"
 SERVICE="${SERVICE:-gtm-verifier}"
 
+# Who may sign in. Authentication is Google OAuth (webapp/auth.py); this list is
+# the authorisation. Edit it and redeploy to add or remove someone.
+#
+# Not IAP: Cloud Run's built-in IAP authenticates against a Google-managed OAuth
+# client that only admits identities inside the project's own organisation, so
+# approved users on other domains could never get in. See notes/cloud-followups.md #4.
+ALLOWED_USERS="${ALLOWED_USERS:-fela@cloud-runner.co.uk,misterfela@gmail.com,keith.lavender@assemblyglobal.com}"
+
+# Secret Manager secret names (created once — see HOWTORUN.txt).
+SECRET_FLASK_KEY="${SECRET_FLASK_KEY:-gtm-verifier-flask-key}"
+SECRET_OAUTH_ID="${SECRET_OAUTH_ID:-gtm-verifier-oauth-client-id}"
+SECRET_OAUTH_SECRET="${SECRET_OAUTH_SECRET:-gtm-verifier-oauth-client-secret}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -36,9 +49,11 @@ echo "Deploying $SERVICE to $PROJECT_ID ($REGION)…"
 #   --memory 4Gi         Chromium needs >= 2 GB, and /tmp is tmpfs on top (#6).
 #   --cpu-boost          cold start includes launching a browser.
 #   gen2                 real /dev/shm and full syscall compatibility for Chromium.
-#   --no-allow-unauthenticated + --ingress all
-#                        correct pairing for IAP: IAP terminates auth in front
-#                        while the service itself stays IAM-protected (#4).
+#   --allow-unauthenticated
+#                        the app authenticates its own users (webapp/auth.py),
+#                        so Cloud Run must let the sign-in page through. The
+#                        service refuses to start if auth is unconfigured, so
+#                        this cannot silently expose an open app.
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT_ID" \
   --region "$REGION" \
@@ -53,31 +68,23 @@ gcloud run deploy "$SERVICE" \
   --session-affinity \
   --execution-environment gen2 \
   --ingress all \
-  --no-allow-unauthenticated \
-  --set-env-vars HEADLESS=1,PYTHONUNBUFFERED=1
+  --allow-unauthenticated \
+  `# ^;^ switches gcloud's delimiter to ';' so ALLOWED_USERS can hold a` \
+  `# comma-separated list. Not '@' — that appears in every email address.` \
+  --set-env-vars "^;^HEADLESS=1;PYTHONUNBUFFERED=1;ALLOWED_USERS=${ALLOWED_USERS}" \
+  --set-secrets "FLASK_SECRET_KEY=${SECRET_FLASK_KEY}:latest,OAUTH_CLIENT_ID=${SECRET_OAUTH_ID}:latest,OAUTH_CLIENT_SECRET=${SECRET_OAUTH_SECRET}:latest"
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE" \
   --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')"
 
-# Report the access model as it actually is, not as intended — the service is
-# IAM-protected from the first deploy, but IAP is a separate opt-in step and
-# until it's on, a browser gets a bare 403 with no sign-in prompt.
-IAP_ENABLED="$(gcloud run services describe "$SERVICE" \
-  --project "$PROJECT_ID" --region "$REGION" \
-  --format='value(metadata.annotations."run.googleapis.com/iap-enabled")' 2>/dev/null)"
-
 echo
 echo "Deployed: $SERVICE_URL"
 echo
-if [ "$IAP_ENABLED" = "True" ] || [ "$IAP_ENABLED" = "true" ]; then
-  echo "IAP is on — open the URL and sign in with an account granted"
-  echo "roles/iap.httpsResourceAccessor."
-else
-  echo "IAP is NOT enabled — the service only accepts a bearer token, so"
-  echo "opening the URL in a browser returns 403. Either finish the IAP setup"
-  echo "in HOWTORUN.txt, or reach it in a browser meanwhile with:"
-  echo "  gcloud run services proxy $SERVICE --project $PROJECT_ID --region $REGION"
-fi
+echo "Sign-in is Google OAuth, allowlisted to:"
+printf '  %s\n' "${ALLOWED_USERS//,/ }" | tr ' ' '\n' | sed '/^$/d;s/^/  /'
+echo
+echo "The OAuth client's authorised redirect URI must be exactly:"
+echo "  ${SERVICE_URL}/auth/callback"
 echo
 echo "Logs:"
 echo "  gcloud run services logs read $SERVICE --project $PROJECT_ID --region $REGION"

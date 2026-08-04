@@ -42,6 +42,7 @@ from typing import Any, List, Tuple
 from playwright.sync_api import Error as PlaywrightError
 
 import config
+import net_guard
 from browser import audit_page
 from analytics import run_analytics_audit
 from consent import run_consent_audit
@@ -130,7 +131,11 @@ def _run_action(page, kind: str, arg: Any, idx: int) -> int:
     """Perform one action step; returns the new dataLayer marker index."""
     if kind == "goto":
         new_idx = get_datalayer_length(page)
-        page.goto(_absolute(arg))
+        # Journey steps come from an uploaded YAML, so a goto target is caller
+        # input just like the audit URL is — guard it the same way.
+        target = _absolute(arg)
+        net_guard.assert_allowed(target)
+        page.goto(target)
         return new_idx
     if kind == "accept_consent":
         accept_consent(page)

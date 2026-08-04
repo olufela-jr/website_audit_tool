@@ -16,5 +16,11 @@ lxml>=5.0
 Flask>=3.0
 gunicorn>=21.2
 
+# Google sign-in for the web front end (webapp/auth.py). Authlib needs an HTTP
+# client for the OAuth token exchange and OIDC discovery; requests is its
+# default for the Flask integration.
+Authlib>=1.3
+requests>=2.31
+
 # Dev / tests
 pytest>=7.0

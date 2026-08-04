@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GTM / GA4 Verifier</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      max-width: 34rem; margin: 6rem auto; padding: 0 1.5rem;
+      color: #222; line-height: 1.5;
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 .75rem; }
+    p { margin: 0 0 1rem; }
+    .email { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .muted { color: #666; font-size: .9rem; }
+    a.button {
+      display: inline-block; margin-top: .5rem;
+      background: #2563eb; color: #fff; text-decoration: none;
+      padding: .55rem 1rem; border-radius: 6px; font-size: .95rem;
+    }
+    a.button:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  {% if signed_out %}
+    <h1>Signed out</h1>
+    <p>{{ reason }}</p>
+  {% elif reason %}
+    <h1>Can't sign you in</h1>
+    <p>{{ reason }}</p>
+  {% else %}
+    <h1>You don't have access</h1>
+    <p>
+      {% if email %}<span class="email">{{ email }}</span> is not{% else %}That account is not{% endif %}
+      on the allowlist for this tool.
+    </p>
+    <p class="muted">
+      Ask the owner to add you. If you have more than one Google account, you
+      may have signed in with the wrong one.
+    </p>
+  {% endif %}
+  <a class="button" href="{{ url_for('auth.login') }}">Try again</a>
+</body>
+</html>

@@ -35,3 +35,5 @@ gtm_verifier/config.yaml
 # Claude Code
 .claude/
 CLAUDE.md
+
+local.txt

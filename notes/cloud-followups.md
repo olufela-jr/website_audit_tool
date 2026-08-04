@@ -41,22 +41,39 @@ instance.
 scaled down, and the download then 404s with "this report has expired". Real
 fix: shared storage (GCS / Firestore) or regenerate-on-download.
 
-## 4. No auth + user-supplied URLs = SSRF/abuse surface — PARTLY MITIGATED
-Anyone who can reach the app can drive a real browser at any URL, including the
-GCP metadata endpoint (169.254.169.254) and anything else reachable from the
-Cloud Run instance. The "authorized" checkbox gating side-effecting journeys is
-honour-system.
-*Mitigation:* IAP in front of the service, `--no-allow-unauthenticated` on the
-service itself. Only allowlisted Google accounts can reach it at all.
-Access is an explicit per-user IAM allowlist
-(`roles/iap.httpsResourceAccessor`), not a domain — approved users may be on
-any domain, and the org has no domain-restricted-sharing policy.
-*Residual — this is the weakest spot:* the SSRF is entirely unmitigated for
-anyone who *is* signed in, and it runs with the service's own network position.
-Because the allowlist is per-user rather than domain-bounded, every addition is
-a deliberate grant of that capability. Deny private/link-local ranges before
-the list grows beyond people you'd trust with it, and before attaching a
-service account with any real IAM.
+## 4. No auth + user-supplied URLs = SSRF/abuse surface — DONE (both halves)
+
+**Auth.** Google OAuth in the app itself (`webapp/auth.py`) plus an
+`ALLOWED_USERS` allowlist; manage it with `./users.sh`. The app refuses to
+start unless auth is configured or `AUTH_DISABLED=1` is set explicitly, so
+`--allow-unauthenticated` on the service cannot leave it open.
+
+This replaced IAP, which could not work here: Cloud Run's integrated IAP
+authenticates against a Google-managed OAuth client and so admits only
+identities inside the project's own organisation. Approved users on gmail.com
+and assemblyglobal.com were rejected regardless of their IAM binding, and a
+custom OAuth client cannot be attached to Cloud Run's integrated IAP —
+`gcloud beta iap web enable --oauth2-client-id` accepts only `app-engine` and
+`backend-services`. The remaining IAP route was an external load balancer with
+its own OAuth client; app-level auth was chosen over that.
+
+**SSRF.** `net_guard.py` resolves every target and refuses private, loopback,
+link-local (169.254.169.254), multicast, unspecified and reserved addresses,
+plus non-http(s) schemes and the cloud metadata hostnames. Resolution is the
+point: a hostname anyone can register may point at 127.0.0.1, so checking the
+string proves nothing. Enforced at the web form, the CLI entry point, every
+raw fetch *including each redirect hop*, the browser fetch, and journey `goto`
+steps. `ALLOW_PRIVATE_TARGETS=1` opts out for local staging work.
+
+*Residual:*
+- **DNS rebinding.** The check happens at request time; a name whose answer
+  changes between check and connect can still slip through. Closing it needs
+  connection-level pinning in both urllib and Chromium.
+- **Sub-resources.** A public page that embeds `<img src="http://169.254...">`
+  still causes the browser to issue that request. No response body reaches the
+  operator, so this leaks little, but it is not blocked.
+- The "authorized" checkbox gating side-effecting journeys remains
+  honour-system.
 
 ## 5. Committed client config must not ship in the image — DONE
 `gtm_verifier/config.yaml` (auto-loaded on import) and `palm_view_config.yaml`

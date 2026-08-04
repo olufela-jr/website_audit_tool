@@ -51,6 +51,7 @@ import browser  # noqa: E402
 import config  # noqa: E402
 import consent  # noqa: E402
 import journeys as journeys_mod  # noqa: E402
+import net_guard  # noqa: E402
 import network  # noqa: E402
 import remote_config  # noqa: E402
 import seo  # noqa: E402
@@ -59,7 +60,30 @@ import tags_inventory  # noqa: E402
 from core import CheckResult, Severity, failed_check, score_checks, skip_check  # noqa: E402
 from export import export_to_powerpoint  # noqa: E402
 
+from .auth import current_user, init_app as init_auth  # noqa: E402
+
 app = Flask(__name__)
+
+# Google sign-in + email allowlist in front of every route. Raises at startup if
+# it is neither configured nor explicitly disabled — this app drives a browser
+# at arbitrary URLs, so it must never come up accidentally open.
+init_auth(app)
+
+
+@app.route("/_health")
+def healthz():
+    """Unauthenticated liveness check (see _PUBLIC_ENDPOINTS in auth.py).
+
+    Not /healthz: Cloud Run's frontend reserves that path and answers it with
+    its own 404, so the request never reaches the container.
+    """
+    return "ok", 200
+
+
+@app.context_processor
+def _inject_user():
+    """Templates show who is signed in, and offer a way out."""
+    return {"current_user": current_user()}
 
 # Form field the operator ticks to confirm the client has authorized us to
 # drive their site (journeys submit forms and can place test orders). Honour
@@ -214,6 +238,19 @@ def run_audit():
             )
     if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # Primary SSRF gate. Everything downstream (browser navigations, raw
+    # fetches) is guarded too, but refusing here means a blocked target never
+    # starts a browser at all, and the operator gets one clear message instead
+    # of seven audits each reporting their own failure.
+    if url:
+        blocked = net_guard.check_url(url)
+        if blocked is not None:
+            return render_template(
+                "index.html", groups=AUDIT_GROUPS, url=url, measurement_id=measurement_id,
+                error=f"That target is not allowed — {blocked}. "
+                      "This tool only audits public internet hosts.",
+            )
 
     # Apply the uploaded config so the consent selector / timeouts take effect
     # for this run. Without an upload, whatever config.yaml auto-loaded stays —

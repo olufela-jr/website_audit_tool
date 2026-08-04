@@ -24,6 +24,7 @@ from typing import Callable, Dict, List, Tuple
 
 import browser
 import config  # auto-loads config.yaml on import when present
+import net_guard
 from core import CheckResult, failed_check, print_report
 from export import export_to_powerpoint
 import journeys
@@ -136,6 +137,15 @@ def main() -> None:
 
     if args.url:
         config.set_base_url(args.url)
+        # Same guard as the web app. Auditing a local staging site from the CLI
+        # is legitimate, so the message points at the opt-out rather than just
+        # refusing (see net_guard).
+        blocked = net_guard.check_url(config.BASE_URL)
+        if blocked is not None:
+            print(f"Refusing to audit {config.BASE_URL} — {blocked}.", file=sys.stderr)
+            print("Set ALLOW_PRIVATE_TARGETS=1 to audit private/local addresses.",
+                  file=sys.stderr)
+            sys.exit(2)
     if args.measurement_id:
         config.MEASUREMENT_ID = args.measurement_id
 

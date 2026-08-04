@@ -58,8 +58,7 @@ DEPLOYED WEB APP (Cloud Run)
 ----------------------------
 The web front end also runs in GCP, so the team can audit without a local venv:
 project project-atlas-audit, region europe-west2, service gtm-verifier.
-It sits behind IAP — sign in with a Google account that has been granted
-roles/iap.httpsResourceAccessor.
+Open the service URL and sign in with Google; only allowlisted addresses get in.
 
 Ship a new revision (Cloud Build builds the Dockerfile; no local Docker needed):
   ./deploy.sh
@@ -68,67 +67,90 @@ Tail logs:
   gcloud run services logs read gtm-verifier \
       --project project-atlas-audit --region europe-west2
 
+
+ADDING A USER
+  ./users.sh add someone@example.com [more@example.com ...]
+  ./users.sh list
+  ./users.sh remove someone@example.com
+
+  Any Google account works - gmail.com, a client's domain, anything.
+  ./users.sh updates ALLOWED_USERS on the running service (a new revision, no
+  rebuild, ~30s). Keep deploy.sh's ALLOWED_USERS default in sync or the next
+  full deploy reverts it.
+
+  Everyone on the list can drive a real browser at any PUBLIC url from inside
+  GCP. Private/loopback/link-local targets are refused by net_guard.py, but
+  read notes/cloud-followups.md #4 before adding people outside the team.
+
+
+HOW SIGN-IN WORKS (and why it is not IAP)
+  Google OAuth in the app itself (gtm_verifier/webapp/auth.py): Google proves
+  who you are, ALLOWED_USERS decides whether you may in.
+
+  This started as Cloud Run's built-in IAP, which was abandoned because it
+  authenticates against a Google-managed OAuth client and therefore admits only
+  identities inside the project's own organisation (cloud-runner.co.uk).
+  Approved users on gmail.com or assemblyglobal.com were rejected no matter
+  what the IAM allowlist said, and a custom OAuth client cannot be attached to
+  Cloud Run's integrated IAP - gcloud accepts --oauth2-client-id only for
+  app-engine and backend-services. The alternative was an external load
+  balancer; app-level auth was chosen instead.
+
+  The app REFUSES TO START if auth is neither configured nor explicitly
+  disabled, so --allow-unauthenticated on the service cannot leave it open.
+
 FIRST-TIME GCP SETUP (once per machine)
   gcloud auth login fela@cloud-runner.co.uk
   gcloud config set account fela@cloud-runner.co.uk
   gcloud config set project project-atlas-audit
   gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
-                         artifactregistry.googleapis.com iap.googleapis.com
+                         artifactregistry.googleapis.com secretmanager.googleapis.com
 
-FIRST-TIME IAP SETUP (already done for this project)
-  Cloud Run's integrated IAP supplies its own Google-managed OAuth client, so
-  there is NO OAuth consent screen to configure in the console — enabling it is
-  the whole step:
-     gcloud beta run services update gtm-verifier \
-         --project project-atlas-audit --region europe-west2 --iap
-  It also needs cloudresourcemanager.googleapis.com enabled for the IAM calls
-  below to work.
+FIRST-TIME OAUTH SETUP (once per project, console only)
+  1. APIs & Services -> OAuth consent screen -> External. Publish it, so
+     sign-in is not capped at 100 manually-listed test users. Publishing
+     exposes nothing: ALLOWED_USERS is what grants access.
+  2. APIs & Services -> Credentials -> Create credentials -> OAuth client ID
+     -> Web application. Authorised redirect URI must be EXACTLY:
+        https://gtm-verifier-ugecjj4wua-nw.a.run.app/auth/callback
+     Add the alias URL too if you use it:
+        https://gtm-verifier-1014181982156.europe-west2.run.app/auth/callback
+  3. Store the credentials (the app reads them from Secret Manager):
+        printf %s 'CLIENT_ID' | gcloud secrets create gtm-verifier-oauth-client-id \
+            --project project-atlas-audit --replication-policy=automatic --data-file=-
+        printf %s 'CLIENT_SECRET' | gcloud secrets create gtm-verifier-oauth-client-secret \
+            --project project-atlas-audit --replication-policy=automatic --data-file=-
+     Then let the runtime service account read them:
+        for s in gtm-verifier-oauth-client-id gtm-verifier-oauth-client-secret \
+                 gtm-verifier-flask-key; do
+          gcloud secrets add-iam-policy-binding "$s" --project project-atlas-audit \
+            --member='serviceAccount:1014181982156-compute@developer.gserviceaccount.com' \
+            --role='roles/secretmanager.secretAccessor'
+        done
 
-ADDING A USER
-     ./iap_access.sh add someone@example.com [more@example.com ...]
-     ./iap_access.sh list
-     ./iap_access.sh remove someone@example.com
+  Rotating a credential: add a new secret version, then redeploy (the service
+  pins :latest at deploy time, so a new version alone changes nothing).
 
-  Access is an explicit per-user allowlist, and it is IAM — signing in with
-  Google is not enough, the account also needs the binding. Any domain works;
-  the org has no domain-restricted-sharing policy. Changes take up to a minute,
-  and an already-signed-in user may need a hard reload to clear the old verdict.
-
-  Once the list grows past a handful, make a Google Group and bind it once
-  instead of maintaining individual bindings:
-     ./iap_access.sh add group:audit-team@cloud-runner.co.uk
-
-  Anyone with access can drive a real browser at any URL from inside GCP —
-  see notes/cloud-followups.md #4 before widening the list.
-
-TWO PERMISSIONS, TWO LAYERS
-  browser user --[iap.httpsResourceAccessor]--> IAP --[run.invoker]--> service
-
-  iap_access.sh     roles/iap.httpsResourceAccessor, on the IAP resource.
-                    What a PERSON needs. This is the one you will use.
-  invoker_access.sh roles/run.invoker, on the Cloud Run service. Held by IAP's
-                    own service agent so IAP can call the app on a user's
-                    behalf. Granted automatically; people do not need it.
-
-  The two are separate resources, which is why the commands differ — see the
-  header of each script.
+  gtm-verifier-flask-key signs the session cookie. Replacing it signs everyone
+  out; it was generated at setup and never needs to be seen.
 
 PROGRAMMATIC ACCESS
-  Not currently set up. With IAP enabled, a plain Cloud Run identity token
-  (`gcloud auth print-identity-token`) is rejected with 401, and
-  `gcloud run services proxy` no longer reaches the app either — IAP intercepts
-  both. A script or CI job would need an OIDC token minted for IAP's OAuth
-  client ID as its audience, plus its service account on the iap_access.sh
-  allowlist.
+  Not set up. The app expects an interactive Google sign-in and a session
+  cookie; there is no API token path. A CI job would need a service account
+  flow adding to webapp/auth.py.
 
-Test the container locally before deploying (Cloud Run injects PORT):
+RUN THE CONTAINER LOCALLY (Cloud Run injects PORT)
   docker build -t gtm-verifier .
-  docker run --rm -e PORT=8080 -p 8080:8080 gtm-verifier   # http://localhost:8080
+  docker run --rm -e PORT=8080 -e AUTH_DISABLED=1 -p 8080:8080 gtm-verifier
+  # http://localhost:8080 - AUTH_DISABLED skips sign-in. LOCAL USE ONLY.
+
+  To audit a local/staging site, the SSRF guard needs the same opt-out:
+  ALLOW_PRIVATE_TARGETS=1 (env var, both CLI and web app). Without it, private,
+  loopback and link-local targets are refused.
 
 The deployed service is deliberately single-tenant per instance and keeps
 results in process memory. Read notes/cloud-followups.md before changing any
-flag in deploy.sh — several of them stand in for unfixed bugs.
-
+flag in deploy.sh - several of them stand in for unfixed bugs.
 
 NOTES
 -----

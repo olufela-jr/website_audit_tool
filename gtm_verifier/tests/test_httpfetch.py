@@ -1,10 +1,35 @@
-"""Unit tests for the stdlib HTTP fetch helper. urlopen is monkeypatched so no
-network is touched."""
+"""Unit tests for the stdlib HTTP fetch helper. The opener is monkeypatched so
+no network is touched, and the SSRF guard is stubbed to allow — its own
+behaviour is covered in test_net_guard.py."""
 
+import pytest
 from urllib.error import URLError
 
 import httpfetch
+import net_guard
 from httpfetch import HttpResult, fetch
+
+
+@pytest.fixture(autouse=True)
+def _allow_all_targets(monkeypatch):
+    """Let every URL through the guard; these tests are about transport.
+    Without this the guard would do real DNS for example.com."""
+    monkeypatch.setattr(net_guard, "check_url", lambda url: None)
+
+
+class _FakeOpener:
+    """Stands in for the object build_opener returns."""
+
+    def __init__(self, behaviour):
+        self._behaviour = behaviour
+
+    def open(self, req, timeout=None):
+        return self._behaviour()
+
+
+def _patch_opener(monkeypatch, behaviour):
+    monkeypatch.setattr(httpfetch, "build_opener",
+                        lambda *handlers: _FakeOpener(behaviour))
 
 
 def test_ok_property():
@@ -13,14 +38,39 @@ def test_ok_property():
 
 
 def test_fetch_urlerror_returns_error(monkeypatch):
-    def boom(*a, **k):
+    def boom():
         raise URLError("dns fail")
 
-    monkeypatch.setattr(httpfetch, "urlopen", boom)
+    _patch_opener(monkeypatch, boom)
     r = fetch("https://nope.invalid")
     assert not r.ok
     assert r.status == 0
     assert "dns fail" in r.error
+
+
+def test_fetch_refuses_blocked_target(monkeypatch):
+    """The guard runs before any connection is attempted."""
+    monkeypatch.setattr(net_guard, "check_url", lambda url: "loopback address")
+
+    def should_not_run():
+        raise AssertionError("opener must not be called for a blocked target")
+
+    _patch_opener(monkeypatch, should_not_run)
+    r = fetch("http://127.0.0.1/")
+    assert not r.ok
+    assert "blocked" in r.error and "loopback" in r.error
+
+
+def test_fetch_refuses_redirect_to_blocked_target(monkeypatch):
+    """A public URL that 302s somewhere internal is refused mid-flight."""
+    def redirected():
+        raise net_guard.BlockedTargetError(
+            "Refusing to fetch http://169.254.169.254/ — link-local address.")
+
+    _patch_opener(monkeypatch, redirected)
+    r = fetch("https://example.com")
+    assert not r.ok
+    assert "blocked" in r.error and "169.254.169.254" in r.error
 
 
 class _FakeHeaders:
@@ -50,7 +100,7 @@ class _FakeResp:
 
 
 def test_fetch_success_lowercases_headers(monkeypatch):
-    monkeypatch.setattr(httpfetch, "urlopen", lambda *a, **k: _FakeResp())
+    _patch_opener(monkeypatch, _FakeResp)
     r = fetch("https://example.com")
     assert r.ok and r.status == 200
     assert r.headers["content-type"] == "text/html"  # keys lower-cased
@@ -64,6 +114,6 @@ def test_fetch_decodes_gzip(monkeypatch):
 
     body = gzip.compress(b"hello gzipped")
     resp = _FakeResp(body=body, headers={"Content-Encoding": "gzip"})
-    monkeypatch.setattr(httpfetch, "urlopen", lambda *a, **k: resp)
+    _patch_opener(monkeypatch, lambda: resp)
     r = fetch("https://example.com")
     assert r.text == "hello gzipped"

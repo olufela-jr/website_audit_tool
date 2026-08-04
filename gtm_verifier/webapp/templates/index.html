@@ -48,6 +48,9 @@
     .config-upload input[type=file] { font-size: .9rem; }
     .config-upload .blurb { margin-top: .45rem; }
 
+    .signed-in { float: right; margin: 0; font-size: .82rem; color: #888; }
+    .signed-in a { color: #888; }
+
     /* Running overlay */
     #overlay {
       display: none; position: fixed; inset: 0; z-index: 50;
@@ -67,6 +70,11 @@
   </style>
 </head>
 <body>
+  {% if current_user %}
+    <p class="signed-in">
+      Signed in as {{ current_user }} &middot; <a href="{{ url_for('auth.logout') }}">sign out</a>
+    </p>
+  {% endif %}
   <h1>GTM / GA4 Verifier</h1>
   <p class="sub">Audit a site's analytics setup. Each audit drives a real browser against the site, so a run takes a couple of minutes.</p>
 

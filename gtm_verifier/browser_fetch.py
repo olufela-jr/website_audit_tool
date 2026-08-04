@@ -17,6 +17,7 @@ paths return the same `HttpResult`, so the audits don't need to care which ran.
 
 from playwright.sync_api import Error as PlaywrightError
 
+import net_guard
 from browser import audit_page
 from httpfetch import HttpResult, fetch
 
@@ -57,6 +58,13 @@ def fetch_via_browser(url: str, page=None, timeout: float = 20.0) -> HttpResult:
 
 
 def _browser_fetch(page, recorder, url: str, timeout: float) -> HttpResult:
+    # The browser path returns the response body to the caller, so it is the
+    # one that would turn an internal endpoint into readable data. Guard it
+    # even though the raw-HTTP attempt that precedes it was already checked —
+    # fetch_via_browser is also called directly.
+    blocked = net_guard.check_url(url)
+    if blocked is not None:
+        return HttpResult(url, 0, error=f"blocked: {blocked}")
     try:
         # Navigate to the target so (a) the in-page fetch below is same-origin
         # and (b) the navigation's real response is available — some headers
